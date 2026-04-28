@@ -1,189 +1,252 @@
 /**
- * ESP32-S3 + CC1101 Receiver with SH1106 OLED display
- * Library: RadioLib (jgromes/RadioLib), U8g2 (olikraus/U8g2)
+ * @file    main.cpp
+ * @brief   ESP32-S3 + CC1101 RF receiver with SH1106 OLED status display.
  *
- * Matched to ATtiny3226 transmitter (ELECHOUSE SmartRC):
- *   OOK modulation, 4.8 kbps, sync 0xD391, CRC enabled
+ * Receives OOK packets transmitted by an ATtiny3226 (ELECHOUSE SmartRC-compatible).
+ * Decoded packet details (hex, ASCII, RSSI) are shown on the OLED and serial port.
  *
- * ── Wiring ───────────────────────────────────────────────────────────────────
- *   CC1101    ESP32-S3
- *   VCC       3.3V
- *   GND       GND
- *   SCK       GPIO 40
- *   MOSI      GPIO 41
- *   MISO      GPIO 42
- *   CSN       GPIO 38
- *   GDO0      GPIO 2     packet interrupt
+ * Libraries
+ *   RadioLib  — jgromes/RadioLib
+ *   U8g2      — olikraus/U8g2
  *
- *   SH1106    ESP32-S3
- *   VCC       3.3V
- *   GND       GND
- *   SDA       GPIO 8
- *   SCL       GPIO 9
- * ─────────────────────────────────────────────────────────────────────────────
+ * Wiring
+ *   Peripheral  Signal  ESP32-S3 GPIO
+ *   ─────────────────────────────────
+ *   CC1101      SCK     40
+ *               MOSI    41
+ *               MISO    42
+ *               CSN     38
+ *               GDO0     2   (packet interrupt)
+ *   SH1106      SDA      8
+ *               SCL      9
+ *   Both        VCC     3.3V
+ *               GND     GND
  */
 
 #include <RadioLib.h>
 #include <SPI.h>
 #include <U8g2lib.h>
 
-// ── CC1101 pins ──────────────────────────────────────────────────────────────
-#define CC1101_SCK   40
-#define CC1101_MISO  42
-#define CC1101_MOSI  41
-#define CC1101_CS    38
-#define CC1101_GDO0   2
+// ---------------------------------------------------------------------------
+// Hardware configuration
+// ---------------------------------------------------------------------------
 
-// ── SH1106 I2C pins ──────────────────────────────────────────────────────────
-#define OLED_SDA      8
-#define OLED_SCL      9
+namespace Pin {
+    // CC1101 (SPI — routed through GPIO matrix, not FSPI IOMUX)
+    constexpr int CC_SCK  = 40;
+    constexpr int CC_MISO = 42;
+    constexpr int CC_MOSI = 41;
+    constexpr int CC_CS   = 38;
+    constexpr int CC_GDO0 =  2;
 
-CC1101 radio = new Module(CC1101_CS, CC1101_GDO0, RADIOLIB_NC, RADIOLIB_NC);
-
-// Hardware I2C with explicit SDA/SCL pins (reset=none, clock=SCL, data=SDA)
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
-
-volatile bool receivedFlag = false;
-
-// ── Display state ────────────────────────────────────────────────────────────
-static uint32_t packetCount = 0;
-static char     dispHex[48]   = {};
-static char     dispAscii[22] = {};
-static float    dispRssi      = 0.0f;
-static bool     hasPacket     = false;
-
-void IRAM_ATTR onReceive() {
-    receivedFlag = true;
+    // SH1106 (I2C)
+    constexpr int OLED_SDA = 8;
+    constexpr int OLED_SCL = 9;
 }
 
-// ── Draw current state to OLED ───────────────────────────────────────────────
-void drawDisplay() {
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_6x10_tr);
+namespace Radio {
+    constexpr float   FREQUENCY_MHZ  = 433.92f;
+    constexpr float   BITRATE_KBPS   =   4.8f;
+    constexpr float   DEVIATION_KHZ  =   5.157f;
+    constexpr float   RXBW_KHZ       = 203.0f;
+    constexpr int     POWER_DBM      =  10;
+    constexpr int     PREAMBLE_BITS  =  16;    // 2 bytes, CC1101 minimum
+    constexpr uint8_t SYNC_BYTE_1    = 0xD3;
+    constexpr uint8_t SYNC_BYTE_2    = 0x91;
+}
 
-    // Header row: title + packet counter
-    u8g2.drawStr(0, 10, "CC1101 RX");
-    if (packetCount > 0) {
-        char cnt[12];
-        snprintf(cnt, sizeof(cnt), "#%lu", packetCount);
-        u8g2.drawStr(128 - (int)u8g2.getStrWidth(cnt), 10, cnt);
+namespace Display {
+    constexpr uint8_t WIDTH         = 128;
+    constexpr uint8_t HEIGHT        =  64;
+    constexpr uint8_t LINE_HEIGHT   =  14;
+    constexpr int     HEX_MAX_BYTES =   7;    // bytes shown on OLED before "..."
+}
+
+// ---------------------------------------------------------------------------
+// Peripherals
+// ---------------------------------------------------------------------------
+
+CC1101 radio = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
+
+// Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
+    U8G2_R0, U8X8_PIN_NONE, Pin::OLED_SCL, Pin::OLED_SDA);
+
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
+
+struct PacketInfo {
+    char     hex[48]   = {};
+    char     ascii[22] = {};
+    float    rssi      = 0.0f;
+    uint32_t count     = 0;
+    bool     valid     = false;
+};
+
+static PacketInfo lastPacket;
+static volatile bool packetReady = false;
+
+// ---------------------------------------------------------------------------
+// ISR
+// ---------------------------------------------------------------------------
+
+void IRAM_ATTR onPacketReceived() {
+    packetReady = true;
+}
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+static void displaySplash(const char* line1, const char* line2 = nullptr) {
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tr);
+    display.drawStr(0, 20, line1);
+    if (line2) display.drawStr(0, 36, line2);
+    display.sendBuffer();
+}
+
+static void displayPacket(const PacketInfo& pkt) {
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x10_tr);
+
+    // Header: "CC1101 RX" on left, packet counter on right
+    display.drawStr(0, 10, "CC1101 RX");
+    if (pkt.count > 0) {
+        char counter[12];
+        snprintf(counter, sizeof(counter), "#%lu", pkt.count);
+        display.drawStr(Display::WIDTH - display.getStrWidth(counter), 10, counter);
     }
-    u8g2.drawHLine(0, 12, 128);
+    display.drawHLine(0, 12, Display::WIDTH);
 
-    if (!hasPacket) {
-        u8g2.drawStr(0, 32, "Listening...");
+    if (!pkt.valid) {
+        display.drawStr(0, 32, "Listening...");
     } else {
-        // Row 2: RSSI
-        char rssiStr[20];
-        snprintf(rssiStr, sizeof(rssiStr), "RSSI: %.0f dBm", dispRssi);
-        u8g2.drawStr(0, 26, rssiStr);
+        char rssiLine[20];
+        snprintf(rssiLine, sizeof(rssiLine), "RSSI: %.0f dBm", pkt.rssi);
+        display.drawStr(0, 26, rssiLine);
+        display.drawStr(0, 40, pkt.hex);
 
-        // Row 3: hex bytes (up to ~21 chars wide)
-        u8g2.drawStr(0, 40, dispHex);
-
-        // Row 4: ASCII payload
         char asciiLine[24];
-        snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", dispAscii);
-        u8g2.drawStr(0, 54, asciiLine);
+        snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", pkt.ascii);
+        display.drawStr(0, 54, asciiLine);
     }
 
-    u8g2.sendBuffer();
+    display.sendBuffer();
 }
+
+// ---------------------------------------------------------------------------
+// Radio helpers
+// ---------------------------------------------------------------------------
+
+static void buildHexString(const uint8_t* data, int len, char* out, size_t outSize) {
+    out[0] = '\0';
+    int shown = min(len, Display::HEX_MAX_BYTES);
+    for (int i = 0; i < shown; i++) {
+        char tmp[4];
+        snprintf(tmp, sizeof(tmp), "%02X ", data[i]);
+        strncat(out, tmp, outSize - strlen(out) - 1);
+    }
+    if (len > Display::HEX_MAX_BYTES) {
+        strncat(out, "...", outSize - strlen(out) - 1);
+    }
+}
+
+static void buildAsciiString(const uint8_t* data, int len, char* out, size_t outSize) {
+    int maxChars = min(len, (int)(outSize - 1));
+    for (int i = 0; i < maxChars; i++) {
+        out[i] = isprint(data[i]) ? (char)data[i] : '.';
+    }
+    out[maxChars] = '\0';
+}
+
+static void logPacketToSerial(const PacketInfo& pkt, const uint8_t* rawData, int len) {
+    Serial.printf("── Packet %lu (%d bytes) ─────────────────\n", pkt.count, len);
+    Serial.print("  Hex:   ");
+    for (int i = 0; i < len; i++) Serial.printf("%02X ", rawData[i]);
+    Serial.println();
+    Serial.printf("  ASCII: \"%s\"\n", pkt.ascii);
+    Serial.printf("  RSSI:  %.1f dBm\n", pkt.rssi);
+    Serial.println("─────────────────────────────────────────\n");
+}
+
+// ---------------------------------------------------------------------------
+// Arduino entry points
+// ---------------------------------------------------------------------------
 
 void setup() {
     Serial.begin(115200);
+    // Wait up to 3 s for USB CDC host (ESP32-S3 native USB)
     for (uint32_t t = millis(); !Serial && (millis() - t < 3000); ) delay(10);
 
-    // Init OLED first so we can show status during radio init
-    u8g2.begin();
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.drawStr(0, 20, "CC1101 RX");
-    u8g2.drawStr(0, 36, "Initializing...");
-    u8g2.sendBuffer();
+    // OLED up first so errors are visible on screen
+    display.begin();
+    displaySplash("CC1101 RX", "Initializing...");
 
     Serial.println("\n==============================");
-    Serial.println("  ESP32 CC1101 Receiver");
+    Serial.println("  ESP32-S3 CC1101 Receiver");
     Serial.println("==============================");
 
-    SPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CS);
+    SPI.begin(Pin::CC_SCK, Pin::CC_MISO, Pin::CC_MOSI, Pin::CC_CS);
 
-    int state = radio.begin(433.92, 4.8, 5.157, 203.0, 10, 16);
+    int state = radio.begin(
+        Radio::FREQUENCY_MHZ,
+        Radio::BITRATE_KBPS,
+        Radio::DEVIATION_KHZ,
+        Radio::RXBW_KHZ,
+        Radio::POWER_DBM,
+        Radio::PREAMBLE_BITS);
+
     if (state != RADIOLIB_ERR_NONE) {
+        char errMsg[24];
+        snprintf(errMsg, sizeof(errMsg), "Err code: %d", state);
         Serial.printf("[ERROR] CC1101 init failed: %d\n", state);
-        u8g2.clearBuffer();
-        u8g2.drawStr(0, 20, "CC1101 ERROR");
-        char errStr[20];
-        snprintf(errStr, sizeof(errStr), "Code: %d", state);
-        u8g2.drawStr(0, 36, errStr);
-        u8g2.sendBuffer();
+        displaySplash("CC1101 FAILED", errMsg);
         while (true) delay(1000);
     }
-    Serial.println("[OK] CC1101 detected");
 
     radio.setOOK(true);
-    radio.setSyncWord(0xD3, 0x91);
+    radio.setSyncWord(Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
     radio.setCrcFiltering(true);
-
-    radio.setGdo0Action(onReceive, RISING);
+    radio.setGdo0Action(onPacketReceived, RISING);
     radio.startReceive();
 
-    Serial.println("  Modulation: OOK");
-    Serial.println("  Frequency:  433.92 MHz");
-    Serial.println("  Data rate:  4.8 kbps");
-    Serial.println("  Sync word:  0xD391");
-    Serial.println("  CRC:        enabled");
+    Serial.println("[OK] CC1101 ready");
+    Serial.printf("  Frequency:  %.2f MHz\n",  Radio::FREQUENCY_MHZ);
+    Serial.printf("  Data rate:  %.1f kbps\n", Radio::BITRATE_KBPS);
+    Serial.printf("  Sync word:  0x%02X%02X\n", Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
+    Serial.println("  Modulation: OOK | CRC: enabled");
     Serial.println("\n[LISTENING]\n");
 
-    drawDisplay();
+    displayPacket(lastPacket);  // shows "Listening..."
 }
 
 void loop() {
-    if (!receivedFlag) return;
-    receivedFlag = false;
+    if (!packetReady) return;
+    packetReady = false;
 
-    int len = radio.getPacketLength();
+    const int len = radio.getPacketLength();
     if (len <= 0) {
         radio.startReceive();
         return;
     }
 
     uint8_t buf[64];
-    int state = radio.readData(buf, len);
+    const int state = radio.readData(buf, len);
     radio.startReceive();
 
     if (state != RADIOLIB_ERR_NONE) {
-        Serial.printf("[WARN] readData: %d\n", state);
+        Serial.printf("[WARN] readData error: %d\n", state);
         return;
     }
 
-    packetCount++;
-    dispRssi = radio.getRSSI();
+    lastPacket.count++;
+    lastPacket.rssi  = radio.getRSSI();
+    lastPacket.valid = true;
+    buildHexString(buf, len, lastPacket.hex, sizeof(lastPacket.hex));
+    buildAsciiString(buf, len, lastPacket.ascii, sizeof(lastPacket.ascii));
 
-    // Build hex string — up to 7 bytes shown, then "..."
-    dispHex[0] = '\0';
-    int hexBytes = (len < 7) ? len : 7;
-    for (int i = 0; i < hexBytes; i++) {
-        char tmp[4];
-        snprintf(tmp, sizeof(tmp), "%02X ", buf[i]);
-        strncat(dispHex, tmp, sizeof(dispHex) - strlen(dispHex) - 1);
-    }
-    if (len > 7) strncat(dispHex, "...", sizeof(dispHex) - strlen(dispHex) - 1);
-
-    // Build ASCII string — up to 21 chars
-    int asciiMax = (len < (int)(sizeof(dispAscii) - 1)) ? len : (int)(sizeof(dispAscii) - 1);
-    for (int i = 0; i < asciiMax; i++)
-        dispAscii[i] = isprint(buf[i]) ? (char)buf[i] : '.';
-    dispAscii[asciiMax] = '\0';
-
-    hasPacket = true;
-    drawDisplay();
-
-    Serial.printf("── Packet %lu (%d bytes) ─────────────────\n", packetCount, len);
-    Serial.print("  Hex:   ");
-    for (int i = 0; i < len; i++) Serial.printf("%02X ", buf[i]);
-    Serial.println();
-    Serial.printf("  ASCII: \"%s\"\n", dispAscii);
-    Serial.printf("  RSSI:  %.1f dBm\n", dispRssi);
-    Serial.println("─────────────────────────────────────────\n");
+    displayPacket(lastPacket);
+    logPacketToSerial(lastPacket, buf, len);
 }
