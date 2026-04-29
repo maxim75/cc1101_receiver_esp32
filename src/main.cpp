@@ -307,7 +307,7 @@ void loop() {
         uint8_t buf[32] = {};
         uint8_t len = nrf24.getDynamicPayloadSize();
         if (len == 0 || len > sizeof(buf)) len = nrf24.getPayloadSize();
-        if (len == 0 || len > sizeof(buf)) len = sizeof(buf);
+        if (len == 0 || len > sizeof(buf)) len = (uint8_t)sizeof(buf);
         nrf24.read(buf, len);
 
         fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
