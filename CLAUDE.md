@@ -32,10 +32,10 @@ pio run --target clean
 **Wiring:**
 | Peripheral | Signal | GPIO |
 |------------|--------|------|
-| CC1101     | SCK    | 40   |
-|            | MOSI   | 41   |
-|            | MISO   | 42   |
-|            | CSN    | 38   |
+| CC1101     | SCK    | 12   |
+|            | MOSI   | 11   |
+|            | MISO   | 13   |
+|            | CSN    | 10   |
 |            | GDO0   | 2 (packet interrupt) |
 | SH1106     | SDA    | 8    |
 |            | SCL    | 9    |
