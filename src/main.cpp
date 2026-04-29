@@ -68,9 +68,9 @@ namespace Radio {
 }
 
 namespace Nrf {
-    constexpr float FREQUENCY_MHZ = 2400.0f;   // channel 0; increment by 1 per channel
-    constexpr int   DATA_RATE     =     1;      // 1 Mbps (0 = 250 kbps, 2 = 2 Mbps)
-    constexpr int   POWER_DBM     =   -12;
+    constexpr int16_t FREQUENCY_MHZ = 2400;    // channel 0; increment by 1 per channel
+    constexpr int16_t DATA_RATE_KBPS = 1000;   // 250, 1000, or 2000
+    constexpr int8_t  POWER_DBM      =  -12;
 }
 
 namespace Display {
@@ -257,7 +257,7 @@ void setup() {
     Serial.println("  Modulation: OOK | CRC: enabled");
 
     // --- nRF24L01 ---
-    state = nrf24.begin(Nrf::FREQUENCY_MHZ, Nrf::DATA_RATE, Nrf::POWER_DBM);
+    state = nrf24.begin(Nrf::FREQUENCY_MHZ, Nrf::DATA_RATE_KBPS, Nrf::POWER_DBM);
     if (state != RADIOLIB_ERR_NONE) {
         char errMsg[24];
         snprintf(errMsg, sizeof(errMsg), "nRF24 err: %d", state);
@@ -271,9 +271,9 @@ void setup() {
     nrf24.startReceive();
 
     Serial.println("[OK] nRF24 ready");
-    Serial.printf("  Frequency:  %.0f MHz (ch %d)\n",
-                  Nrf::FREQUENCY_MHZ, (int)(Nrf::FREQUENCY_MHZ - 2400.0f));
-    Serial.printf("  Data rate:  %d Mbps\n", Nrf::DATA_RATE);
+    Serial.printf("  Frequency:  %d MHz (ch %d)\n",
+                  Nrf::FREQUENCY_MHZ, Nrf::FREQUENCY_MHZ - 2400);
+    Serial.printf("  Data rate:  %d kbps\n", Nrf::DATA_RATE_KBPS);
     Serial.println("\n[LISTENING]\n");
 
     displayPacket(lastPacket);  // shows "Listening..."
