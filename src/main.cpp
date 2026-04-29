@@ -8,7 +8,8 @@
  * and serial port.
  *
  * Libraries
- *   RadioLib  — jgromes/RadioLib
+ *   RadioLib  — jgromes/RadioLib   (CC1101)
+ *   RF24      — nrf24/RF24          (nRF24L01)
  *   U8g2      — olikraus/U8g2
  *
  * Wiring
@@ -29,6 +30,8 @@
  */
 
 #include <RadioLib.h>
+#include <RF24.h>
+#include <nRF24L01.h>
 #include <SPI.h>
 #include <U8g2lib.h>
 
@@ -68,9 +71,7 @@ namespace Radio {
 }
 
 namespace Nrf {
-    constexpr int16_t FREQUENCY_MHZ = 2400;    // channel 0; increment by 1 per channel
-    constexpr int16_t DATA_RATE_KBPS = 1000;   // 250, 1000, or 2000
-    constexpr int8_t  POWER_DBM      =  -12;
+    constexpr uint64_t ADDRESS = 0xFAB7C2F0E2LL;  // must match transmitter
 }
 
 namespace Display {
@@ -84,7 +85,7 @@ namespace Display {
 // ---------------------------------------------------------------------------
 
 CC1101 cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
-nRF24  nrf24  = new Module(Pin::NRF_CS, Pin::NRF_IRQ, RADIOLIB_NC, Pin::NRF_CE);
+RF24   nrf24(Pin::NRF_CE, Pin::NRF_CS);
 
 // Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
@@ -106,14 +107,12 @@ struct PacketInfo {
 
 static PacketInfo lastPacket;
 static volatile bool cc1101Ready = false;
-static volatile bool nrf24Ready  = false;
 
 // ---------------------------------------------------------------------------
 // ISRs
 // ---------------------------------------------------------------------------
 
 void IRAM_ATTR onCc1101Packet() { cc1101Ready = true; }
-void IRAM_ATTR onNrf24Packet()  { nrf24Ready  = true; }
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -257,23 +256,19 @@ void setup() {
     Serial.println("  Modulation: OOK | CRC: enabled");
 
     // --- nRF24L01 ---
-    state = nrf24.begin(Nrf::FREQUENCY_MHZ, Nrf::DATA_RATE_KBPS, Nrf::POWER_DBM);
-    if (state != RADIOLIB_ERR_NONE) {
-        char errMsg[24];
-        snprintf(errMsg, sizeof(errMsg), "nRF24 err: %d", state);
-        Serial.printf("[ERROR] nRF24 init failed: %d\n", state);
-        displaySplash("nRF24 FAILED", errMsg);
+    if (!nrf24.begin(&SPI)) {
+        Serial.println("[ERROR] nRF24 init failed");
+        displaySplash("nRF24 FAILED", "check wiring");
         while (true) delay(1000);
     }
-
-    // IRQ is active-low; use attachInterrupt so RadioLib ISR internals don't interfere
-    attachInterrupt(digitalPinToInterrupt(Pin::NRF_IRQ), onNrf24Packet, FALLING);
-    nrf24.startReceive();
+    nrf24.setDataRate(RF24_250KBPS);
+    nrf24.openReadingPipe(0, Nrf::ADDRESS);
+    nrf24.setPALevel(RF24_PA_MAX, true);
+    nrf24.startListening();
 
     Serial.println("[OK] nRF24 ready");
-    Serial.printf("  Frequency:  %d MHz (ch %d)\n",
-                  Nrf::FREQUENCY_MHZ, Nrf::FREQUENCY_MHZ - 2400);
-    Serial.printf("  Data rate:  %d kbps\n", Nrf::DATA_RATE_KBPS);
+    Serial.printf("  Address:    0x%010llX\n", Nrf::ADDRESS);
+    Serial.println("  Data rate:  250 kbps | PA: MAX");
     Serial.println("\n[LISTENING]\n");
 
     displayPacket(lastPacket);  // shows "Listening..."
@@ -300,23 +295,12 @@ void loop() {
         logPacketToSerial(lastPacket, buf, len);
     }
 
-    if (nrf24Ready) {
-        nrf24Ready = false;
+    if (nrf24.available()) {
+        uint8_t buf[32] = {};
+        nrf24.read(buf, sizeof(buf));
 
-        uint8_t buf[32];
-        int len = nrf24.getPacketLength();
-        if (len <= 0) len = sizeof(buf);    // fall back to max fixed payload
-
-        const int state = nrf24.readData(buf, len);
-        nrf24.startReceive();
-
-        if (state != RADIOLIB_ERR_NONE) {
-            Serial.printf("[WARN] nRF24 readData error: %d\n", state);
-            return;
-        }
-
-        fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
+        fillPacket(lastPacket, "nRF24", buf, sizeof(buf), 0.0f, false);
         displayPacket(lastPacket);
-        logPacketToSerial(lastPacket, buf, len);
+        logPacketToSerial(lastPacket, buf, sizeof(buf));
     }
 }
