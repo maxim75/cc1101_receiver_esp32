@@ -1,9 +1,11 @@
 /**
  * @file    main.cpp
- * @brief   ESP32-S3 + CC1101 RF receiver with SH1106 OLED status display.
+ * @brief   ESP32-S3 + CC1101 + nRF24L01 dual RF receiver with SH1106 OLED display.
  *
- * Receives OOK packets transmitted by an ATtiny3226 (ELECHOUSE SmartRC-compatible).
- * Decoded packet details (hex, ASCII, RSSI) are shown on the OLED and serial port.
+ * CC1101  — receives OOK packets from an ATtiny3226 (ELECHOUSE SmartRC-compatible).
+ * nRF24L01— receives 2.4 GHz packets on the same FSPI bus.
+ * Decoded packet details (hex, ASCII, RSSI where available) are shown on the OLED
+ * and serial port.
  *
  * Libraries
  *   RadioLib  — jgromes/RadioLib
@@ -12,14 +14,17 @@
  * Wiring
  *   Peripheral  Signal  ESP32-S3 GPIO
  *   ─────────────────────────────────
- *   CC1101      SCK     12
- *               MOSI    11
- *               MISO    13
- *               CSN     10
- *               GDO0     2   (packet interrupt)
+ *   (shared)    SCK     12  ┐
+ *               MOSI    11  │ FSPI bus
+ *               MISO    13  ┘
+ *   CC1101      CSN     10
+ *               GDO0     2   (packet interrupt, RISING)
+ *   nRF24L01    CSN      6
+ *               CE       5
+ *               IRQ      4   (packet interrupt, FALLING)
  *   SH1106      SDA      8
  *               SCL      9
- *   Both        VCC     3.3V
+ *   All         VCC     3.3V
  *               GND     GND
  */
 
@@ -32,12 +37,19 @@
 // ---------------------------------------------------------------------------
 
 namespace Pin {
-    // CC1101 (SPI using ESP32-S3 standard FSPI pins)
-    constexpr int CC_SCK  = 12;
-    constexpr int CC_MISO = 13;
-    constexpr int CC_MOSI = 11;
+    // Shared FSPI bus
+    constexpr int SCK  = 12;
+    constexpr int MISO = 13;
+    constexpr int MOSI = 11;
+
+    // CC1101
     constexpr int CC_CS   = 10;
     constexpr int CC_GDO0 =  2;
+
+    // nRF24L01
+    constexpr int NRF_CS  =  6;
+    constexpr int NRF_CE  =  5;
+    constexpr int NRF_IRQ =  4;
 
     // SH1106 (I2C)
     constexpr int OLED_SDA = 8;
@@ -55,10 +67,15 @@ namespace Radio {
     constexpr uint8_t SYNC_BYTE_2    = 0x91;
 }
 
+namespace Nrf {
+    constexpr float FREQUENCY_MHZ = 2400.0f;   // channel 0; increment by 1 per channel
+    constexpr int   DATA_RATE     =     1;      // 1 Mbps (0 = 250 kbps, 2 = 2 Mbps)
+    constexpr int   POWER_DBM     =   -12;
+}
+
 namespace Display {
     constexpr uint8_t WIDTH         = 128;
     constexpr uint8_t HEIGHT        =  64;
-    constexpr uint8_t LINE_HEIGHT   =  14;
     constexpr int     HEX_MAX_BYTES =   7;    // bytes shown on OLED before "..."
 }
 
@@ -66,7 +83,8 @@ namespace Display {
 // Peripherals
 // ---------------------------------------------------------------------------
 
-CC1101 radio = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
+CC1101 cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
+nRF24  nrf24  = new Module(Pin::NRF_CS, Pin::NRF_IRQ, RADIOLIB_NC, Pin::NRF_CE);
 
 // Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
@@ -77,23 +95,25 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
 // ---------------------------------------------------------------------------
 
 struct PacketInfo {
-    char     hex[48]   = {};
-    char     ascii[22] = {};
-    float    rssi      = 0.0f;
-    uint32_t count     = 0;
-    bool     valid     = false;
+    char     source[8]  = {};
+    char     hex[48]    = {};
+    char     ascii[22]  = {};
+    float    rssi       = 0.0f;
+    uint32_t count      = 0;
+    bool     valid      = false;
+    bool     hasRssi    = false;
 };
 
 static PacketInfo lastPacket;
-static volatile bool packetReady = false;
+static volatile bool cc1101Ready = false;
+static volatile bool nrf24Ready  = false;
 
 // ---------------------------------------------------------------------------
-// ISR
+// ISRs
 // ---------------------------------------------------------------------------
 
-void IRAM_ATTR onPacketReceived() {
-    packetReady = true;
-}
+void IRAM_ATTR onCc1101Packet() { cc1101Ready = true; }
+void IRAM_ATTR onNrf24Packet()  { nrf24Ready  = true; }
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -111,8 +131,8 @@ static void displayPacket(const PacketInfo& pkt) {
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tr);
 
-    // Header: "CC1101 RX" on left, packet counter on right
-    display.drawStr(0, 10, "CC1101 RX");
+    // Header: source on left, packet counter on right
+    display.drawStr(0, 10, pkt.valid ? pkt.source : "Dual RX");
     if (pkt.count > 0) {
         char counter[12];
         snprintf(counter, sizeof(counter), "#%lu", pkt.count);
@@ -123,14 +143,18 @@ static void displayPacket(const PacketInfo& pkt) {
     if (!pkt.valid) {
         display.drawStr(0, 32, "Listening...");
     } else {
-        char rssiLine[20];
-        snprintf(rssiLine, sizeof(rssiLine), "RSSI: %.0f dBm", pkt.rssi);
-        display.drawStr(0, 26, rssiLine);
-        display.drawStr(0, 40, pkt.hex);
+        uint8_t y = 26;
+        if (pkt.hasRssi) {
+            char rssiLine[20];
+            snprintf(rssiLine, sizeof(rssiLine), "RSSI: %.0f dBm", pkt.rssi);
+            display.drawStr(0, y, rssiLine);
+            y += 14;
+        }
+        display.drawStr(0, y, pkt.hex);   y += 14;
 
         char asciiLine[24];
         snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", pkt.ascii);
-        display.drawStr(0, 54, asciiLine);
+        display.drawStr(0, y, asciiLine);
     }
 
     display.sendBuffer();
@@ -161,13 +185,25 @@ static void buildAsciiString(const uint8_t* data, int len, char* out, size_t out
     out[maxChars] = '\0';
 }
 
+static void fillPacket(PacketInfo& pkt, const char* source,
+                       const uint8_t* buf, int len, float rssi, bool hasRssi) {
+    pkt.count++;
+    pkt.valid   = true;
+    pkt.rssi    = rssi;
+    pkt.hasRssi = hasRssi;
+    strncpy(pkt.source, source, sizeof(pkt.source) - 1);
+    pkt.source[sizeof(pkt.source) - 1] = '\0';
+    buildHexString(buf, len, pkt.hex, sizeof(pkt.hex));
+    buildAsciiString(buf, len, pkt.ascii, sizeof(pkt.ascii));
+}
+
 static void logPacketToSerial(const PacketInfo& pkt, const uint8_t* rawData, int len) {
-    Serial.printf("── Packet %lu (%d bytes) ─────────────────\n", pkt.count, len);
+    Serial.printf("── [%s] Packet %lu (%d bytes) ──────────\n", pkt.source, pkt.count, len);
     Serial.print("  Hex:   ");
     for (int i = 0; i < len; i++) Serial.printf("%02X ", rawData[i]);
     Serial.println();
     Serial.printf("  ASCII: \"%s\"\n", pkt.ascii);
-    Serial.printf("  RSSI:  %.1f dBm\n", pkt.rssi);
+    if (pkt.hasRssi) Serial.printf("  RSSI:  %.1f dBm\n", pkt.rssi);
     Serial.println("─────────────────────────────────────────\n");
 }
 
@@ -182,15 +218,17 @@ void setup() {
 
     // OLED up first so errors are visible on screen
     display.begin();
-    displaySplash("CC1101 RX", "Initializing...");
+    displaySplash("Dual RX", "Initializing...");
 
     Serial.println("\n==============================");
-    Serial.println("  ESP32-S3 CC1101 Receiver");
+    Serial.println("  ESP32-S3 Dual RF Receiver");
     Serial.println("==============================");
 
-    SPI.begin(Pin::CC_SCK, Pin::CC_MISO, Pin::CC_MOSI, Pin::CC_CS);
+    // Single SPI.begin() — both radios share this bus via separate CS pins
+    SPI.begin(Pin::SCK, Pin::MISO, Pin::MOSI);
 
-    int state = radio.begin(
+    // --- CC1101 ---
+    int state = cc1101.begin(
         Radio::FREQUENCY_MHZ,
         Radio::BITRATE_KBPS,
         Radio::DEVIATION_KHZ,
@@ -200,53 +238,85 @@ void setup() {
 
     if (state != RADIOLIB_ERR_NONE) {
         char errMsg[24];
-        snprintf(errMsg, sizeof(errMsg), "Err code: %d", state);
+        snprintf(errMsg, sizeof(errMsg), "CC1101 err: %d", state);
         Serial.printf("[ERROR] CC1101 init failed: %d\n", state);
         displaySplash("CC1101 FAILED", errMsg);
         while (true) delay(1000);
     }
 
-    radio.setOOK(true);
-    radio.setSyncWord(Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
-    radio.setCrcFiltering(true);
-    radio.setGdo0Action(onPacketReceived, RISING);
-    radio.startReceive();
+    cc1101.setOOK(true);
+    cc1101.setSyncWord(Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
+    cc1101.setCrcFiltering(true);
+    cc1101.setGdo0Action(onCc1101Packet, RISING);
+    cc1101.startReceive();
 
     Serial.println("[OK] CC1101 ready");
     Serial.printf("  Frequency:  %.2f MHz\n",  Radio::FREQUENCY_MHZ);
     Serial.printf("  Data rate:  %.1f kbps\n", Radio::BITRATE_KBPS);
     Serial.printf("  Sync word:  0x%02X%02X\n", Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
     Serial.println("  Modulation: OOK | CRC: enabled");
+
+    // --- nRF24L01 ---
+    state = nrf24.begin(Nrf::FREQUENCY_MHZ, Nrf::DATA_RATE, Nrf::POWER_DBM);
+    if (state != RADIOLIB_ERR_NONE) {
+        char errMsg[24];
+        snprintf(errMsg, sizeof(errMsg), "nRF24 err: %d", state);
+        Serial.printf("[ERROR] nRF24 init failed: %d\n", state);
+        displaySplash("nRF24 FAILED", errMsg);
+        while (true) delay(1000);
+    }
+
+    // IRQ is active-low; use attachInterrupt so RadioLib ISR internals don't interfere
+    attachInterrupt(digitalPinToInterrupt(Pin::NRF_IRQ), onNrf24Packet, FALLING);
+    nrf24.startReceive();
+
+    Serial.println("[OK] nRF24 ready");
+    Serial.printf("  Frequency:  %.0f MHz (ch %d)\n",
+                  Nrf::FREQUENCY_MHZ, (int)(Nrf::FREQUENCY_MHZ - 2400.0f));
+    Serial.printf("  Data rate:  %d Mbps\n", Nrf::DATA_RATE);
     Serial.println("\n[LISTENING]\n");
 
     displayPacket(lastPacket);  // shows "Listening..."
 }
 
 void loop() {
-    if (!packetReady) return;
-    packetReady = false;
+    if (cc1101Ready) {
+        cc1101Ready = false;
 
-    const int len = radio.getPacketLength();
-    if (len <= 0) {
-        radio.startReceive();
-        return;
+        const int len = cc1101.getPacketLength();
+        if (len <= 0) { cc1101.startReceive(); return; }
+
+        uint8_t buf[64];
+        const int state = cc1101.readData(buf, len);
+        cc1101.startReceive();
+
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[WARN] CC1101 readData error: %d\n", state);
+            return;
+        }
+
+        fillPacket(lastPacket, "CC1101", buf, len, cc1101.getRSSI(), true);
+        displayPacket(lastPacket);
+        logPacketToSerial(lastPacket, buf, len);
     }
 
-    uint8_t buf[64];
-    const int state = radio.readData(buf, len);
-    radio.startReceive();
+    if (nrf24Ready) {
+        nrf24Ready = false;
 
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.printf("[WARN] readData error: %d\n", state);
-        return;
+        uint8_t buf[32];
+        int len = nrf24.getPacketLength();
+        if (len <= 0) len = sizeof(buf);    // fall back to max fixed payload
+
+        const int state = nrf24.readData(buf, len);
+        nrf24.startReceive();
+
+        if (state != RADIOLIB_ERR_NONE) {
+            Serial.printf("[WARN] nRF24 readData error: %d\n", state);
+            return;
+        }
+
+        fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
+        displayPacket(lastPacket);
+        logPacketToSerial(lastPacket, buf, len);
     }
-
-    lastPacket.count++;
-    lastPacket.rssi  = radio.getRSSI();
-    lastPacket.valid = true;
-    buildHexString(buf, len, lastPacket.hex, sizeof(lastPacket.hex));
-    buildAsciiString(buf, len, lastPacket.ascii, sizeof(lastPacket.ascii));
-
-    displayPacket(lastPacket);
-    logPacketToSerial(lastPacket, buf, len);
 }
