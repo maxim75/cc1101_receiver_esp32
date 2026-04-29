@@ -305,10 +305,13 @@ void loop() {
 
     if (nrf24.available()) {
         uint8_t buf[32] = {};
-        nrf24.read(buf, sizeof(buf));
+        uint8_t len = nrf24.getDynamicPayloadSize();
+        if (len == 0 || len > sizeof(buf)) len = nrf24.getPayloadSize();
+        if (len == 0 || len > sizeof(buf)) len = sizeof(buf);
+        nrf24.read(buf, len);
 
-        fillPacket(lastPacket, "nRF24", buf, sizeof(buf), 0.0f, false);
+        fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
         displayPacket(lastPacket);
-        logPacketToSerial(lastPacket, buf, sizeof(buf));
+        logPacketToSerial(lastPacket, buf, len);
     }
 }
