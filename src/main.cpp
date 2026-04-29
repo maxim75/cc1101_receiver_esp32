@@ -85,7 +85,7 @@ namespace Display {
 
 CC1101 cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
 nRF24  nrf24  = new Module(Pin::NRF_CS, Pin::NRF_IRQ, Pin::NRF_CE, RADIOLIB_NC,
-                           SPI, SPISettings(500000, MSBFIRST, SPI_MODE0));
+                           SPI, SPISettings(2000000, MSBFIRST, SPI_MODE0));
 
 // Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
@@ -258,6 +258,18 @@ void setup() {
     Serial.println("  Modulation: OOK | CRC: enabled");
 
     // --- nRF24L01 ---
+    // Unlock the FEATURE register on nRF24L01 (non-plus) via the ACTIVATE command.
+    // nRF24L01+ has it unlocked by default; this is a harmless no-op there.
+    // RadioLib writes to FEATURE during begin() without sending ACTIVATE first,
+    // causing the SPI paranoid readback to fail (-16) on original nRF24L01 chips.
+    pinMode(Pin::NRF_CS, OUTPUT);
+    SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(Pin::NRF_CS, LOW);
+    SPI.transfer(0x50);  // ACTIVATE command
+    SPI.transfer(0x73);  // unlock magic byte
+    digitalWrite(Pin::NRF_CS, HIGH);
+    SPI.endTransaction();
+
     state = nrf24.begin(Nrf::FREQUENCY_MHZ, Nrf::DATA_RATE_KBPS, Nrf::POWER_DBM);
     if (state != RADIOLIB_ERR_NONE) {
         char errMsg[24];
