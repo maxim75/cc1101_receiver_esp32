@@ -96,12 +96,15 @@ pio run --target clean
 **Wiring:**
 | Peripheral | Signal | GPIO |
 |------------|--------|------|
-| (shared)   | SCK    | 12   |
+| CC1101     | SCK    | 12 (FSPI/SPI2) |
 |            | MOSI   | 11   |
 |            | MISO   | 13   |
-| CC1101     | CSN    | 10   |
+|            | CSN    | 10   |
 |            | GDO0   | 2 (RISING interrupt) |
-| nRF24L01   | CSN    | 6    |
+| nRF24L01   | SCK    | 14 (HSPI/SPI3) |
+|            | MOSI   | 15   |
+|            | MISO   | 16   |
+|            | CSN    | 6    |
 |            | CE     | 5    |
 |            | IRQ    | 4 (FALLING interrupt) |
 | SH1106     | SDA    | 8    |
@@ -111,7 +114,7 @@ pio run --target clean
 
 All firmware lives in `src/main.cpp`. The code is organized into namespaces and a single struct:
 
-- **`Pin::`** — GPIO assignments; SCK/MOSI/MISO are shared bus constants, each radio has its own CS
+- **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 14/15/16), each radio has its own CS
 - **`Radio::`** — CC1101 RF parameters (433.92 MHz, 4.8 kbps, OOK, sync word `0xD391`)
 - **`Nrf::`** — nRF24L01 parameters (2400 MHz ch 0, 1 Mbps, −12 dBm)
 - **`Display::`** — OLED layout constants

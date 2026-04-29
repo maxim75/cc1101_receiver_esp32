@@ -3,7 +3,7 @@
  * @brief   ESP32-S3 + CC1101 + nRF24L01 dual RF receiver with SH1106 OLED display.
  *
  * CC1101  — receives OOK packets from an ATtiny3226 (ELECHOUSE SmartRC-compatible).
- * nRF24L01— receives 2.4 GHz packets on the same FSPI bus.
+ * nRF24L01— receives 2.4 GHz packets on a dedicated HSPI bus.
  * Decoded packet details (hex, ASCII, RSSI where available) are shown on the OLED
  * and serial port.
  *
@@ -15,12 +15,15 @@
  * Wiring
  *   Peripheral  Signal  ESP32-S3 GPIO
  *   ─────────────────────────────────
- *   (shared)    SCK     12  ┐
- *               MOSI    11  │ FSPI bus
+ *   CC1101      SCK     12  ┐
+ *               MOSI    11  │ FSPI bus (SPI2)
  *               MISO    13  ┘
- *   CC1101      CSN     10
+ *               CSN     10
  *               GDO0     2   (packet interrupt, RISING)
- *   nRF24L01    CSN      6
+ *   nRF24L01    SCK     14  ┐
+ *               MOSI    15  │ HSPI bus (SPI3)
+ *               MISO    16  ┘
+ *               CSN      6
  *               CE       5
  *               IRQ      4   (packet interrupt, FALLING)
  *   SH1106      SDA      8
@@ -40,7 +43,7 @@
 // ---------------------------------------------------------------------------
 
 namespace Pin {
-    // Shared FSPI bus
+    // FSPI bus (SPI2) — CC1101
     constexpr int SCK  = 12;
     constexpr int MISO = 13;
     constexpr int MOSI = 11;
@@ -48,6 +51,11 @@ namespace Pin {
     // CC1101
     constexpr int CC_CS   = 10;
     constexpr int CC_GDO0 =  2;
+
+    // HSPI bus (SPI3) — nRF24L01
+    constexpr int NRF_SCK  = 14;
+    constexpr int NRF_MOSI = 15;
+    constexpr int NRF_MISO = 16;
 
     // nRF24L01
     constexpr int NRF_CS  =  6;
@@ -84,8 +92,9 @@ namespace Display {
 // Peripherals
 // ---------------------------------------------------------------------------
 
-CC1101 cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
-RF24   nrf24(Pin::NRF_CE, Pin::NRF_CS);
+CC1101    cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
+SPIClass  hspi(HSPI);
+RF24      nrf24(Pin::NRF_CE, Pin::NRF_CS);
 
 // Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
@@ -223,8 +232,8 @@ void setup() {
     Serial.println("  ESP32-S3 Dual RF Receiver");
     Serial.println("==============================");
 
-    // Single SPI.begin() — both radios share this bus via separate CS pins
     SPI.begin(Pin::SCK, Pin::MISO, Pin::MOSI);
+    hspi.begin(Pin::NRF_SCK, Pin::NRF_MISO, Pin::NRF_MOSI, Pin::NRF_CS);
 
     // --- CC1101 ---
     int state = cc1101.begin(
@@ -256,7 +265,7 @@ void setup() {
     Serial.println("  Modulation: OOK | CRC: enabled");
 
     // --- nRF24L01 ---
-    if (!nrf24.begin(&SPI)) {
+    if (!nrf24.begin(&hspi)) {
         Serial.println("[ERROR] nRF24 init failed");
         displaySplash("nRF24 FAILED", "check wiring");
         while (true) delay(1000);
