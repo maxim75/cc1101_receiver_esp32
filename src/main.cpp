@@ -3,23 +3,27 @@
  * @brief   ESP32-S3 + CC1101 + nRF24L01 dual RF receiver with SH1106 OLED display.
  *
  * CC1101  — receives OOK packets from an ATtiny3226 (ELECHOUSE SmartRC-compatible).
- * nRF24L01— receives 2.4 GHz packets on the same FSPI bus.
+ * nRF24L01— receives 2.4 GHz packets on a dedicated HSPI bus.
  * Decoded packet details (hex, ASCII, RSSI where available) are shown on the OLED
  * and serial port.
  *
  * Libraries
- *   RadioLib  — jgromes/RadioLib
+ *   RadioLib  — jgromes/RadioLib   (CC1101)
+ *   RF24      — nrf24/RF24          (nRF24L01)
  *   U8g2      — olikraus/U8g2
  *
  * Wiring
  *   Peripheral  Signal  ESP32-S3 GPIO
  *   ─────────────────────────────────
- *   (shared)    SCK     12  ┐
- *               MOSI    11  │ FSPI bus
+ *   CC1101      SCK     12  ┐
+ *               MOSI    11  │ FSPI bus (SPI2)
  *               MISO    13  ┘
- *   CC1101      CSN     10
+ *               CSN     10
  *               GDO0     2   (packet interrupt, RISING)
- *   nRF24L01    CSN      6
+ *   nRF24L01    SCK     14  ┐
+ *               MOSI    15  │ HSPI bus (SPI3)
+ *               MISO    16  ┘
+ *               CSN      6
  *               CE       5
  *               IRQ      4   (packet interrupt, FALLING)
  *   SH1106      SDA      8
@@ -29,6 +33,8 @@
  */
 
 #include <RadioLib.h>
+#include <RF24.h>
+#include <nRF24L01.h>
 #include <SPI.h>
 #include <U8g2lib.h>
 
@@ -37,7 +43,7 @@
 // ---------------------------------------------------------------------------
 
 namespace Pin {
-    // Shared FSPI bus
+    // FSPI bus (SPI2) — CC1101
     constexpr int SCK  = 12;
     constexpr int MISO = 13;
     constexpr int MOSI = 11;
@@ -45,6 +51,11 @@ namespace Pin {
     // CC1101
     constexpr int CC_CS   = 10;
     constexpr int CC_GDO0 =  2;
+
+    // HSPI bus (SPI3) — nRF24L01
+    constexpr int NRF_SCK  = 14;
+    constexpr int NRF_MOSI = 15;
+    constexpr int NRF_MISO = 16;
 
     // nRF24L01
     constexpr int NRF_CS  =  6;
@@ -68,9 +79,7 @@ namespace Radio {
 }
 
 namespace Nrf {
-    constexpr int16_t FREQUENCY_MHZ = 2476;    // channel 0; increment by 1 per channel
-    constexpr int16_t DATA_RATE_KBPS = 250;   // 250, 1000, or 2000
-    constexpr int8_t  POWER_DBM      =  -12;
+    constexpr uint64_t ADDRESS = 0xFAB7C2F0E2LL;  // must match transmitter
 }
 
 namespace Display {
@@ -82,10 +91,9 @@ namespace Display {
 // ---------------------------------------------------------------------------
 // Peripherals
 // ---------------------------------------------------------------------------
-
-CC1101 cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
-nRF24  nrf24  = new Module(Pin::NRF_CS, Pin::NRF_IRQ, Pin::NRF_CE, RADIOLIB_NC,
-                           SPI, SPISettings(2000000, MSBFIRST, SPI_MODE0));
+CC1101    cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
+SPIClass  hspi(HSPI);
+RF24      nrf24(Pin::NRF_CE, Pin::NRF_CS);
 
 // Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
@@ -107,14 +115,12 @@ struct PacketInfo {
 
 static PacketInfo lastPacket;
 static volatile bool cc1101Ready = false;
-static volatile bool nrf24Ready  = false;
 
 // ---------------------------------------------------------------------------
 // ISRs
 // ---------------------------------------------------------------------------
 
 void IRAM_ATTR onCc1101Packet() { cc1101Ready = true; }
-void IRAM_ATTR onNrf24Packet()  { nrf24Ready  = true; }
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -225,8 +231,8 @@ void setup() {
     Serial.println("  ESP32-S3 Dual RF Receiver");
     Serial.println("==============================");
 
-    // Single SPI.begin() — both radios share this bus via separate CS pins
     SPI.begin(Pin::SCK, Pin::MISO, Pin::MOSI);
+    hspi.begin(Pin::NRF_SCK, Pin::NRF_MISO, Pin::NRF_MOSI, Pin::NRF_CS);
 
     // --- CC1101 ---
     int state = cc1101.begin(
@@ -258,35 +264,19 @@ void setup() {
     Serial.println("  Modulation: OOK | CRC: enabled");
 
     // --- nRF24L01 ---
-    // Unlock the FEATURE register on nRF24L01 (non-plus) via the ACTIVATE command.
-    // nRF24L01+ has it unlocked by default; this is a harmless no-op there.
-    // RadioLib writes to FEATURE during begin() without sending ACTIVATE first,
-    // causing the SPI paranoid readback to fail (-16) on original nRF24L01 chips.
-    pinMode(Pin::NRF_CS, OUTPUT);
-    SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(Pin::NRF_CS, LOW);
-    SPI.transfer(0x50);  // ACTIVATE command
-    SPI.transfer(0x73);  // unlock magic byte
-    digitalWrite(Pin::NRF_CS, HIGH);
-    SPI.endTransaction();
-
-    state = nrf24.begin(Nrf::FREQUENCY_MHZ, Nrf::DATA_RATE_KBPS, Nrf::POWER_DBM);
-    if (state != RADIOLIB_ERR_NONE) {
-        char errMsg[24];
-        snprintf(errMsg, sizeof(errMsg), "nRF24 err: %d", state);
-        Serial.printf("[ERROR] nRF24 init failed: %d\n", state);
-        displaySplash("nRF24 FAILED", errMsg);
+    if (!nrf24.begin(&hspi)) {
+        Serial.println("[ERROR] nRF24 init failed");
+        displaySplash("nRF24 FAILED", "check wiring");
         while (true) delay(1000);
     }
-
-    // IRQ is active-low; use attachInterrupt so RadioLib ISR internals don't interfere
-    attachInterrupt(digitalPinToInterrupt(Pin::NRF_IRQ), onNrf24Packet, FALLING);
-    nrf24.startReceive();
+    nrf24.setDataRate(RF24_250KBPS);
+    nrf24.openReadingPipe(0, Nrf::ADDRESS);
+    nrf24.setPALevel(RF24_PA_MAX, true);
+    nrf24.startListening();
 
     Serial.println("[OK] nRF24 ready");
-    Serial.printf("  Frequency:  %d MHz (ch %d)\n",
-                  Nrf::FREQUENCY_MHZ, Nrf::FREQUENCY_MHZ - 2400);
-    Serial.printf("  Data rate:  %d kbps\n", Nrf::DATA_RATE_KBPS);
+    Serial.printf("  Address:    0x%010llX\n", Nrf::ADDRESS);
+    Serial.println("  Data rate:  250 kbps | PA: MAX");
     Serial.println("\n[LISTENING]\n");
 
     displayPacket(lastPacket);  // shows "Listening..."
@@ -313,20 +303,12 @@ void loop() {
         logPacketToSerial(lastPacket, buf, len);
     }
 
-    if (nrf24Ready) {
-        nrf24Ready = false;
-
-        uint8_t buf[32];
-        int len = nrf24.getPacketLength();
-        if (len <= 0) len = sizeof(buf);    // fall back to max fixed payload
-
-        const int state = nrf24.readData(buf, len);
-        nrf24.startReceive();
-
-        if (state != RADIOLIB_ERR_NONE) {
-            Serial.printf("[WARN] nRF24 readData error: %d\n", state);
-            return;
-        }
+    if (nrf24.available()) {
+        uint8_t buf[32] = {};
+        uint8_t len = nrf24.getDynamicPayloadSize();
+        if (len == 0 || len > sizeof(buf)) len = nrf24.getPayloadSize();
+        if (len == 0 || len > sizeof(buf)) len = (uint8_t)sizeof(buf);
+        nrf24.read(buf, len);
 
         fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
         displayPacket(lastPacket);
