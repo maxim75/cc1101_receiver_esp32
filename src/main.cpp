@@ -91,7 +91,6 @@ namespace Display {
 // ---------------------------------------------------------------------------
 // Peripherals
 // ---------------------------------------------------------------------------
-
 CC1101    cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
 SPIClass  hspi(HSPI);
 RF24      nrf24(Pin::NRF_CE, Pin::NRF_CS);
