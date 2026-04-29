@@ -12,10 +12,10 @@
  * Wiring
  *   Peripheral  Signal  ESP32-S3 GPIO
  *   ─────────────────────────────────
- *   CC1101      SCK     40
- *               MOSI    41
- *               MISO    42
- *               CSN     38
+ *   CC1101      SCK     12
+ *               MOSI    11
+ *               MISO    13
+ *               CSN     10
  *               GDO0     2   (packet interrupt)
  *   SH1106      SDA      8
  *               SCL      9
@@ -32,11 +32,11 @@
 // ---------------------------------------------------------------------------
 
 namespace Pin {
-    // CC1101 (SPI — routed through GPIO matrix, not FSPI IOMUX)
-    constexpr int CC_SCK  = 40;
-    constexpr int CC_MISO = 42;
-    constexpr int CC_MOSI = 41;
-    constexpr int CC_CS   = 38;
+    // CC1101 (SPI using ESP32-S3 standard FSPI pins)
+    constexpr int CC_SCK  = 12;
+    constexpr int CC_MISO = 13;
+    constexpr int CC_MOSI = 11;
+    constexpr int CC_CS   = 10;
     constexpr int CC_GDO0 =  2;
 
     // SH1106 (I2C)
