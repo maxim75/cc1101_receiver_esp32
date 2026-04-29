@@ -84,7 +84,8 @@ namespace Display {
 // ---------------------------------------------------------------------------
 
 CC1101 cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
-nRF24  nrf24  = new Module(Pin::NRF_CS, Pin::NRF_IRQ, RADIOLIB_NC, Pin::NRF_CE);
+nRF24  nrf24  = new Module(Pin::NRF_CS, Pin::NRF_IRQ, Pin::NRF_CE, RADIOLIB_NC,
+                           SPI, SPISettings(500000, MSBFIRST, SPI_MODE0));
 
 // Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
