@@ -68,8 +68,8 @@ namespace Radio {
 }
 
 namespace Nrf {
-    constexpr int16_t FREQUENCY_MHZ = 2400;    // channel 0; increment by 1 per channel
-    constexpr int16_t DATA_RATE_KBPS = 1000;   // 250, 1000, or 2000
+    constexpr int16_t FREQUENCY_MHZ = 2476;    // channel 0; increment by 1 per channel
+    constexpr int16_t DATA_RATE_KBPS = 250;   // 250, 1000, or 2000
     constexpr int8_t  POWER_DBM      =  -12;
 }
 
