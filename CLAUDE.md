@@ -102,8 +102,8 @@ pio run --target clean
 |            | CSN    | 10   |
 |            | GDO0   | 2 (RISING interrupt) |
 | nRF24L01   | SCK    | 14 (HSPI/SPI3) |
-|            | MOSI   | 15   |
-|            | MISO   | 16   |
+|            | MOSI   | 1    |
+|            | MISO   | 21   |
 |            | CSN    | 6    |
 |            | CE     | 5    |
 |            | IRQ    | 4 (FALLING interrupt) |
@@ -114,7 +114,7 @@ pio run --target clean
 
 All firmware lives in `src/main.cpp`. The code is organized into namespaces and a single struct:
 
-- **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 14/15/16), each radio has its own CS
+- **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 1/14/21), each radio has its own CS
 - **`Radio::`** — CC1101 RF parameters (433.92 MHz, 4.8 kbps, OOK, sync word `0xD391`)
 - **`Nrf::`** — nRF24L01 pipe address (must match transmitter); RF config is 250 kbps, PA MAX, set at runtime via RF24 APIs
 - **`Display::`** — OLED layout constants

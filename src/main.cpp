@@ -21,8 +21,8 @@
  *               CSN     10
  *               GDO0     2   (packet interrupt, RISING)
  *   nRF24L01    SCK     14  ┐
- *               MOSI    15  │ HSPI bus (SPI3)
- *               MISO    16  ┘
+ *               MOSI     1  │ HSPI bus (SPI3)
+ *               MISO    21  ┘
  *               CSN      6
  *               CE       5
  *               IRQ      4   (packet interrupt, FALLING)
@@ -54,8 +54,8 @@ namespace Pin {
 
     // HSPI bus (SPI3) — nRF24L01
     constexpr int NRF_SCK  = 14;
-    constexpr int NRF_MOSI = 15;
-    constexpr int NRF_MISO = 16;
+    constexpr int NRF_MOSI =  1;
+    constexpr int NRF_MISO = 21;
 
     // nRF24L01
     constexpr int NRF_CS  =  6;
