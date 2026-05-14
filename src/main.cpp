@@ -1,6 +1,6 @@
 /**
  * @file    main.cpp
- * @brief   ESP32-S3 + CC1101 + nRF24L01 dual RF receiver with SH1106 OLED display.
+ * @brief   ESP32-S3 + CC1101 + nRF24L01 dual RF receiver with SH1107 OLED display.
  *
  * CC1101  — receives OOK packets from an ATtiny3226 (ELECHOUSE SmartRC-compatible).
  * nRF24L01— receives 2.4 GHz packets on a dedicated HSPI bus.
@@ -26,7 +26,7 @@
  *               CSN      6
  *               CE       5
  *               IRQ      4   (packet interrupt, FALLING)
- *   SH1106      SDA      8
+ *   SH1107      SDA      8
  *               SCL      9
  *   All         VCC     3.3V
  *               GND     GND
@@ -62,7 +62,7 @@ namespace Pin {
     constexpr int NRF_CE  =  5;
     constexpr int NRF_IRQ =  4;
 
-    // SH1106 (I2C)
+    // SH1107 (I2C)
     constexpr int OLED_SDA = 8;
     constexpr int OLED_SCL = 9;
 }
@@ -84,7 +84,7 @@ namespace Nrf {
 
 namespace Display {
     constexpr uint8_t WIDTH         = 128;
-    constexpr uint8_t HEIGHT        =  64;
+    constexpr uint8_t HEIGHT        = 128;
     constexpr int     HEX_MAX_BYTES =   7;    // bytes shown on OLED before "..."
 }
 
@@ -95,8 +95,8 @@ CC1101    cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC
 SPIClass  hspi(HSPI);
 RF24      nrf24(Pin::NRF_CE, Pin::NRF_CS);
 
-// Full-framebuffer SH1106, hardware I2C, explicit SCL/SDA pins
-U8G2_SH1106_128X64_NONAME_F_HW_I2C display(
+// SH1107 panels differ in column mapping; SEEED variant avoids left/right wrap artifacts.
+U8G2_SH1107_SEEED_128X128_F_HW_I2C display(
     U8G2_R0, U8X8_PIN_NONE, Pin::OLED_SCL, Pin::OLED_SDA);
 
 // ---------------------------------------------------------------------------
@@ -126,11 +126,17 @@ void IRAM_ATTR onCc1101Packet() { cc1101Ready = true; }
 // Display helpers
 // ---------------------------------------------------------------------------
 
+static void drawCenteredText(uint8_t y, const char* text) {
+    int16_t x = (Display::WIDTH - display.getStrWidth(text)) / 2;
+    if (x < 0) x = 0;
+    display.drawStr((uint8_t)x, y, text);
+}
+
 static void displaySplash(const char* line1, const char* line2 = nullptr) {
     display.clearBuffer();
     display.setFont(u8g2_font_6x10_tr);
-    display.drawStr(0, 20, line1);
-    if (line2) display.drawStr(0, 36, line2);
+    drawCenteredText(54, line1);
+    if (line2) drawCenteredText(74, line2);
     display.sendBuffer();
 }
 
@@ -139,29 +145,30 @@ static void displayPacket(const PacketInfo& pkt) {
     display.setFont(u8g2_font_6x10_tr);
 
     // Header: source on left, packet counter on right
-    display.drawStr(0, 10, pkt.valid ? pkt.source : "Dual RX");
+    display.drawStr(0, 12, pkt.valid ? pkt.source : "Dual RX");
     if (pkt.count > 0) {
         char counter[12];
         snprintf(counter, sizeof(counter), "#%lu", pkt.count);
-        display.drawStr(Display::WIDTH - display.getStrWidth(counter), 10, counter);
+        display.drawStr(Display::WIDTH - display.getStrWidth(counter), 12, counter);
     }
-    display.drawHLine(0, 12, Display::WIDTH);
+    display.drawHLine(0, 16, Display::WIDTH);
 
     if (!pkt.valid) {
-        display.drawStr(0, 32, "Listening...");
+        drawCenteredText(68, "Listening...");
     } else {
-        uint8_t y = 26;
+        constexpr uint8_t textX = 4;
+        uint8_t y = 36;
         if (pkt.hasRssi) {
             char rssiLine[20];
             snprintf(rssiLine, sizeof(rssiLine), "RSSI: %.0f dBm", pkt.rssi);
-            display.drawStr(0, y, rssiLine);
-            y += 14;
+            display.drawStr(textX, y, rssiLine);
+            y += 20;
         }
-        display.drawStr(0, y, pkt.hex);   y += 14;
+        display.drawStr(textX, y, pkt.hex);   y += 20;
 
         char asciiLine[24];
         snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", pkt.ascii);
-        display.drawStr(0, y, asciiLine);
+        display.drawStr(textX, y, asciiLine);
     }
 
     display.sendBuffer();

@@ -68,7 +68,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32-S3 firmware that receives OOK RF packets from an ATtiny3226 transmitter (ELECHOUSE SmartRC-compatible protocol) and displays decoded packet data (hex, ASCII, RSSI) on an SH1106 OLED and serial monitor.
+ESP32-S3 firmware that receives OOK RF packets from an ATtiny3226 transmitter (ELECHOUSE SmartRC-compatible protocol) and displays decoded packet data (hex, ASCII, RSSI) on an SH1107 128x128 OLED and serial monitor.
 
 ## Build & Flash Commands
 
@@ -107,7 +107,7 @@ pio run --target clean
 |            | CSN    | 6    |
 |            | CE     | 5    |
 |            | IRQ    | 4 (FALLING interrupt) |
-| SH1106     | SDA    | 8    |
+| SH1107     | SDA    | 8    |
 |            | SCL    | 9    |
 
 ## Architecture
@@ -117,7 +117,7 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 - **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 1/14/21), each radio has its own CS
 - **`Radio::`** — CC1101 RF parameters (433.92 MHz, 4.8 kbps, OOK, sync word `0xD391`)
 - **`Nrf::`** — nRF24L01 pipe address (must match transmitter); RF config is 250 kbps, PA MAX, set at runtime via RF24 APIs
-- **`Display::`** — OLED layout constants
+- **`Display::`** — OLED layout constants (SH1107 128x128)
 - **`PacketInfo`** — last received packet: `source[]`, hex, ASCII, RSSI, count, `hasRssi` flag
 
 **Data flow:**
@@ -137,5 +137,5 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 
 - `jgromes/RadioLib` — CC1101 driver
 - `nrf24/RF24` — nRF24L01 driver
-- `olikraus/U8g2` — SH1106 OLED driver
+- `olikraus/U8g2` — SH1107 OLED driver
 - `bblanchon/ArduinoJson@^6.21.0` — available but not yet used in main flow
