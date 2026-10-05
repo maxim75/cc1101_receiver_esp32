@@ -68,9 +68,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32-S3 firmware that receives fixed-code 433 MHz remotes (EV1527/PT2262) via a CC1101 and 2.4 GHz packets via an nRF24L01, and displays decoded data (hex, remote code info or ASCII, RSSI) on an SH1107 128x128 OLED and serial monitor.
+ESP32-S3 firmware that receives fixed-code 433 MHz remotes (EV1527/PT2262) via a CC1101 and 2.4 GHz packets via an nRF24L01, and displays decoded data (hex, remote code info or ASCII, RSSI) on an SH1107 128x128 OLED and serial monitor. Received events are published over Wi-Fi/MQTT for Home Assistant.
 
 ## Build & Flash Commands
+
+First build requires `include/secrets.h` (gitignored): copy `include/secrets.example.h` and fill in Wi-Fi and MQTT credentials. The build fails with an `#error` if it is missing.
 
 ```bash
 # Build
@@ -117,6 +119,7 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 - **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 1/14/21), each radio has its own CS
 - **`Radio::`** — CC1101 RF parameters (433.92 MHz, OOK async, 270 kHz RX BW) and `REPEAT_GAP_MS` for collapsing repeated remote frames into one press
 - **`Nrf::`** — nRF24L01 pipe address (must match transmitter); RF config is 250 kbps, PA MAX, set at runtime via RF24 APIs
+- **`Mqtt::`** — client ID `rfgateway`, topics, retry interval, buffer size
 - **`Display::`** — OLED layout constants (SH1107 128x128)
 - **`PacketInfo`** — last received packet: `source[]`, hex, ASCII, `info` (remote protocol/bits/pulse; shown instead of ASCII when set), RSSI, count, `hasRssi` flag
 
@@ -125,6 +128,17 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 2. `loop()` polls `rcSwitch.available()`; a code identical to the previous one within `REPEAT_GAP_MS` is treated as the same press and skipped. nRF24 is read with `available()` + `read()`, no re-arm needed
 3. `fillPacket()` populates `lastPacket` (hex truncated to 7 bytes for OLED, source label, RSSI if available); remote codes are stored as big-endian bytes and `info` is set to `P<proto> <bits>bit <pulse>us`
 4. `displayPacket()` and `logRemoteToSerial()` / `logPacketToSerial()` render the result; the OLED header shows which radio received the last packet
+5. `publishRemote()` / `publishNrf()` send the event to MQTT (dropped silently while disconnected)
+
+**MQTT / Home Assistant:** Wi-Fi starts in `setup()` without blocking; `mqttMaintain()` at the top of `loop()` logs Wi-Fi transitions, runs `mqtt.loop()`, and retries the broker every 5 s. A connect attempt to an unreachable broker can block `loop()` for a few seconds.
+| Topic | Payload | Retained |
+|---|---|---|
+| `rfgateway/remote` | `{"code":…,"bits":…,"protocol":…,"pulse":…,"rssi":…}` | no |
+| `nrf/message` | raw packet text up to first NUL (same format as the legacy `nrf_receiver` firmware) | no |
+| `rfgateway/status` | `online` / `offline` (LWT) | yes |
+| `homeassistant/sensor/rfgateway/*/config` | HA discovery for "Last remote code" and "Last nRF24 packet" sensors, published on every connect | yes |
+
+HA automations should use an MQTT trigger on the topic, not the discovery sensors' state (repeated identical codes do not change state).
 
 **SPI buses:** CC1101 uses `SPI` (FSPI/SPI2, `SPI.begin(SCK, MISO, MOSI)`); nRF24L01 uses `hspi` (HSPI/SPI3, `hspi.begin(...)`) passed to `RF24::begin(&hspi)`. The nRF24 IRQ pin is wired but not used — the firmware polls `available()` instead.
 
@@ -132,6 +146,7 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 - RadioLib `CC1101` — `setOOK()`, `receiveDirectAsync()`, `getRSSI()` (live RSSI register read in direct mode)
 - rc-switch `RCSwitch` — `enableReceive()`, `available()`, `getReceivedValue()`, `getReceivedBitlength()`, `getReceivedProtocol()`, `getReceivedDelay()`, `resetAvailable()`
 - RF24 `nRF24L01` — `begin(&spi)`, `setDataRate()`, `openReadingPipe()`, `setPALevel()`, `startListening()`, `available()`, `getDynamicPayloadSize()`, `getPayloadSize()`, `read()`
+- PubSubClient — `setServer()`, `setBufferSize()`, `connect()` with LWT, `publish()`, `loop()`
 - U8g2 full-framebuffer mode (`_F_`) — `clearBuffer()` / `sendBuffer()` pattern for flicker-free updates
 
 ## Dependencies (managed by PlatformIO)
@@ -140,4 +155,5 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 - `sui77/rc-switch` — EV1527/PT2262 remote pulse decoder
 - `nrf24/RF24` — nRF24L01 driver
 - `olikraus/U8g2` — SH1107 OLED driver
-- `bblanchon/ArduinoJson@^6.21.0` — available but not yet used in main flow
+- `knolleary/PubSubClient` — MQTT client
+- `bblanchon/ArduinoJson@^6.21.0` — builds HA discovery payloads
