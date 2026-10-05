@@ -2,13 +2,15 @@
  * @file    main.cpp
  * @brief   ESP32-S3 + CC1101 + nRF24L01 dual RF receiver with SH1107 OLED display.
  *
- * CC1101  — receives OOK packets from an ATtiny3226 (ELECHOUSE SmartRC-compatible).
+ * CC1101  — receives fixed-code 433 MHz remotes (EV1527/PT2262) in async OOK mode;
+ *           demodulated pulses on GDO0 are decoded by rc-switch.
  * nRF24L01— receives 2.4 GHz packets on a dedicated HSPI bus.
- * Decoded packet details (hex, ASCII, RSSI where available) are shown on the OLED
- * and serial port.
+ * Decoded packet details (hex, ASCII or remote code info, RSSI where available)
+ * are shown on the OLED and serial port.
  *
  * Libraries
  *   RadioLib  — jgromes/RadioLib   (CC1101)
+ *   rc-switch — sui77/rc-switch    (remote pulse decoding)
  *   RF24      — nrf24/RF24          (nRF24L01)
  *   U8g2      — olikraus/U8g2
  *
@@ -19,7 +21,7 @@
  *               MOSI    11  │ FSPI bus (SPI2)
  *               MISO    13  ┘
  *               CSN     10
- *               GDO0     2   (packet interrupt, RISING)
+ *               GDO0     2   (async OOK data out, CHANGE interrupt)
  *   nRF24L01    SCK     14  ┐
  *               MOSI     1  │ HSPI bus (SPI3)
  *               MISO    21  ┘
@@ -33,6 +35,7 @@
  */
 
 #include <RadioLib.h>
+#include <RCSwitch.h>
 #include <RF24.h>
 #include <nRF24L01.h>
 #include <SPI.h>
@@ -68,14 +71,12 @@ namespace Pin {
 }
 
 namespace Radio {
-    constexpr float   FREQUENCY_MHZ  = 433.92f;
-    constexpr float   BITRATE_KBPS   =   4.8f;
-    constexpr float   DEVIATION_KHZ  =   5.157f;
-    constexpr float   RXBW_KHZ       = 203.0f;
-    constexpr int     POWER_DBM      =  10;
-    constexpr int     PREAMBLE_BITS  =  16;    // 2 bytes, CC1101 minimum
-    constexpr uint8_t SYNC_BYTE_1    = 0xD3;
-    constexpr uint8_t SYNC_BYTE_2    = 0x91;
+    constexpr float    FREQUENCY_MHZ  = 433.92f;
+    constexpr float    BITRATE_KBPS   =   9.6f;    // finer edge timing in async mode
+    constexpr float    DEVIATION_KHZ  =   5.157f;
+    constexpr float    RXBW_KHZ       = 270.0f;    // tolerate drift of cheap remotes
+    constexpr int      POWER_DBM      =  10;
+    constexpr uint32_t REPEAT_GAP_MS  = 300;       // same code within this gap = same press
 }
 
 namespace Nrf {
@@ -92,6 +93,7 @@ namespace Display {
 // Peripherals
 // ---------------------------------------------------------------------------
 CC1101    cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC);
+RCSwitch  rcSwitch;
 SPIClass  hspi(HSPI);
 RF24      nrf24(Pin::NRF_CE, Pin::NRF_CS);
 
@@ -107,6 +109,7 @@ struct PacketInfo {
     char     source[8]  = {};
     char     hex[48]    = {};
     char     ascii[22]  = {};
+    char     info[22]   = {};    // shown instead of ASCII when set (remote code info)
     float    rssi       = 0.0f;
     uint32_t count      = 0;
     bool     valid      = false;
@@ -114,13 +117,8 @@ struct PacketInfo {
 };
 
 static PacketInfo lastPacket;
-static volatile bool cc1101Ready = false;
-
-// ---------------------------------------------------------------------------
-// ISRs
-// ---------------------------------------------------------------------------
-
-void IRAM_ATTR onCc1101Packet() { cc1101Ready = true; }
+static unsigned long lastRemoteCode   = 0;
+static uint32_t      lastRemoteSeenMs = 0;
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -166,9 +164,13 @@ static void displayPacket(const PacketInfo& pkt) {
         }
         display.drawStr(textX, y, pkt.hex);   y += 20;
 
-        char asciiLine[24];
-        snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", pkt.ascii);
-        display.drawStr(textX, y, asciiLine);
+        if (pkt.info[0]) {
+            display.drawStr(textX, y, pkt.info);
+        } else {
+            char asciiLine[24];
+            snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", pkt.ascii);
+            display.drawStr(textX, y, asciiLine);
+        }
     }
 
     display.sendBuffer();
@@ -207,6 +209,7 @@ static void fillPacket(PacketInfo& pkt, const char* source,
     pkt.hasRssi = hasRssi;
     strncpy(pkt.source, source, sizeof(pkt.source) - 1);
     pkt.source[sizeof(pkt.source) - 1] = '\0';
+    pkt.info[0] = '\0';
     buildHexString(buf, len, pkt.hex, sizeof(pkt.hex));
     buildAsciiString(buf, len, pkt.ascii, sizeof(pkt.ascii));
 }
@@ -218,6 +221,17 @@ static void logPacketToSerial(const PacketInfo& pkt, const uint8_t* rawData, int
     Serial.println();
     Serial.printf("  ASCII: \"%s\"\n", pkt.ascii);
     if (pkt.hasRssi) Serial.printf("  RSSI:  %.1f dBm\n", pkt.rssi);
+    Serial.println("─────────────────────────────────────────\n");
+}
+
+static void logRemoteToSerial(const PacketInfo& pkt, unsigned long code,
+                              unsigned int bits, unsigned int protocol, unsigned int pulseUs) {
+    Serial.printf("── [%s] Press %lu ──────────\n", pkt.source, pkt.count);
+    Serial.printf("  Code:     %lu (0x%lX)\n", code, code);
+    Serial.printf("  Bits:     %u\n", bits);
+    Serial.printf("  Protocol: %u\n", protocol);
+    Serial.printf("  Pulse:    %u us\n", pulseUs);
+    Serial.printf("  RSSI:     %.1f dBm\n", pkt.rssi);
     Serial.println("─────────────────────────────────────────\n");
 }
 
@@ -247,8 +261,7 @@ void setup() {
         Radio::BITRATE_KBPS,
         Radio::DEVIATION_KHZ,
         Radio::RXBW_KHZ,
-        Radio::POWER_DBM,
-        Radio::PREAMBLE_BITS);
+        Radio::POWER_DBM);
 
     if (state != RADIOLIB_ERR_NONE) {
         char errMsg[24];
@@ -259,16 +272,13 @@ void setup() {
     }
 
     cc1101.setOOK(true);
-    cc1101.setSyncWord(Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
-    cc1101.setCrcFiltering(true);
-    cc1101.setGdo0Action(onCc1101Packet, RISING);
-    cc1101.startReceive();
+    cc1101.receiveDirectAsync();    // GDO0 now outputs raw demodulated OOK data
+    rcSwitch.enableReceive(digitalPinToInterrupt(Pin::CC_GDO0));
 
     Serial.println("[OK] CC1101 ready");
     Serial.printf("  Frequency:  %.2f MHz\n",  Radio::FREQUENCY_MHZ);
-    Serial.printf("  Data rate:  %.1f kbps\n", Radio::BITRATE_KBPS);
-    Serial.printf("  Sync word:  0x%02X%02X\n", Radio::SYNC_BYTE_1, Radio::SYNC_BYTE_2);
-    Serial.println("  Modulation: OOK | CRC: enabled");
+    Serial.printf("  RX BW:      %.0f kHz\n",  Radio::RXBW_KHZ);
+    Serial.println("  Modulation: OOK async | Decoder: rc-switch");
 
     // --- nRF24L01 ---
     if (!nrf24.begin(&hspi)) {
@@ -290,24 +300,30 @@ void setup() {
 }
 
 void loop() {
-    if (cc1101Ready) {
-        cc1101Ready = false;
+    if (rcSwitch.available()) {
+        const unsigned long code     = rcSwitch.getReceivedValue();
+        const unsigned int  bits     = rcSwitch.getReceivedBitlength();
+        const unsigned int  protocol = rcSwitch.getReceivedProtocol();
+        const unsigned int  pulseUs  = rcSwitch.getReceivedDelay();
+        rcSwitch.resetAvailable();
 
-        const int len = cc1101.getPacketLength();
-        if (len <= 0) { cc1101.startReceive(); return; }
+        // Remotes repeat each frame many times per press; report a press once
+        const uint32_t now = millis();
+        const bool repeat = code == lastRemoteCode && now - lastRemoteSeenMs < Radio::REPEAT_GAP_MS;
+        lastRemoteCode   = code;
+        lastRemoteSeenMs = now;
 
-        uint8_t buf[64];
-        const int state = cc1101.readData(buf, len);
-        cc1101.startReceive();
+        if (code != 0 && !repeat) {
+            // Code as big-endian bytes so the hex view reads like the code value
+            uint8_t buf[sizeof(code)];
+            const int len = min((int)((bits + 7) / 8), (int)sizeof(buf));
+            for (int i = 0; i < len; i++) buf[i] = (uint8_t)(code >> (8 * (len - 1 - i)));
 
-        if (state != RADIOLIB_ERR_NONE) {
-            Serial.printf("[WARN] CC1101 readData error: %d\n", state);
-            return;
+            fillPacket(lastPacket, "Remote", buf, len, cc1101.getRSSI(), true);
+            snprintf(lastPacket.info, sizeof(lastPacket.info), "P%u %ubit %uus", protocol, bits, pulseUs);
+            displayPacket(lastPacket);
+            logRemoteToSerial(lastPacket, code, bits, protocol, pulseUs);
         }
-
-        fillPacket(lastPacket, "CC1101", buf, len, cc1101.getRSSI(), true);
-        displayPacket(lastPacket);
-        logPacketToSerial(lastPacket, buf, len);
     }
 
     if (nrf24.available()) {
