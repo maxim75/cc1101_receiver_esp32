@@ -6,13 +6,18 @@
  *           demodulated pulses on GDO0 are decoded by rc-switch.
  * nRF24L01— receives 2.4 GHz packets on a dedicated HSPI bus.
  * Decoded packet details (hex, ASCII or remote code info, RSSI where available)
- * are shown on the OLED and serial port.
+ * are shown on the OLED and serial port, and published to MQTT for Home Assistant
+ * (remotes: rfgateway/remote JSON; nRF24: nrf/message plain text).
  *
  * Libraries
  *   RadioLib  — jgromes/RadioLib   (CC1101)
  *   rc-switch — sui77/rc-switch    (remote pulse decoding)
  *   RF24      — nrf24/RF24          (nRF24L01)
  *   U8g2      — olikraus/U8g2
+ *   PubSubClient — knolleary/PubSubClient (MQTT)
+ *   ArduinoJson  — bblanchon/ArduinoJson  (HA discovery payloads)
+ *
+ * Credentials: copy include/secrets.example.h to include/secrets.h (gitignored).
  *
  * Wiring
  *   Peripheral  Signal  ESP32-S3 GPIO
@@ -40,6 +45,15 @@
 #include <nRF24L01.h>
 #include <SPI.h>
 #include <U8g2lib.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "include/secrets.h missing: copy include/secrets.example.h to include/secrets.h and fill it in"
+#endif
 
 // ---------------------------------------------------------------------------
 // Hardware configuration
@@ -83,6 +97,15 @@ namespace Nrf {
     constexpr uint64_t ADDRESS = 0xFAB7C2F0E2LL;  // must match transmitter
 }
 
+namespace Mqtt {
+    constexpr const char* CLIENT_ID    = "rfgateway";
+    constexpr const char* TOPIC_STATUS = "rfgateway/status";   // retained online/offline (LWT)
+    constexpr const char* TOPIC_REMOTE = "rfgateway/remote";   // JSON per remote press
+    constexpr const char* TOPIC_NRF    = "nrf/message";        // same as legacy nrf_receiver
+    constexpr uint32_t    RETRY_MS     = 5000;
+    constexpr uint16_t    BUFFER_SIZE  = 512;                  // fits HA discovery payloads
+}
+
 namespace Display {
     constexpr uint8_t WIDTH         = 128;
     constexpr uint8_t HEIGHT        = 128;
@@ -96,6 +119,8 @@ CC1101    cc1101 = new Module(Pin::CC_CS, Pin::CC_GDO0, RADIOLIB_NC, RADIOLIB_NC
 RCSwitch  rcSwitch;
 SPIClass  hspi(HSPI);
 RF24      nrf24(Pin::NRF_CE, Pin::NRF_CS);
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
 
 // SH1107 panels differ in column mapping; SEEED variant avoids left/right wrap artifacts.
 U8G2_SH1107_SEEED_128X128_F_HW_I2C display(
@@ -119,6 +144,8 @@ struct PacketInfo {
 static PacketInfo lastPacket;
 static unsigned long lastRemoteCode   = 0;
 static uint32_t      lastRemoteSeenMs = 0;
+static uint32_t      lastMqttAttemptMs = 0;
+static bool          wifiWasUp         = false;
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -236,6 +263,81 @@ static void logRemoteToSerial(const PacketInfo& pkt, unsigned long code,
 }
 
 // ---------------------------------------------------------------------------
+// MQTT / Home Assistant
+// ---------------------------------------------------------------------------
+
+// Announce a sensor via Home Assistant MQTT discovery (retained).
+// valueTemplate == nullptr means the state topic carries plain text.
+static void publishDiscoverySensor(const char* objectId, const char* name,
+                                   const char* stateTopic, const char* valueTemplate) {
+    char uniqueId[48];
+    snprintf(uniqueId, sizeof(uniqueId), "%s_%s", Mqtt::CLIENT_ID, objectId);
+
+    StaticJsonDocument<512> doc;
+    doc["name"]               = name;
+    doc["unique_id"]          = uniqueId;
+    doc["state_topic"]        = stateTopic;
+    doc["availability_topic"] = Mqtt::TOPIC_STATUS;
+    if (valueTemplate) {
+        doc["value_template"]        = valueTemplate;
+        doc["json_attributes_topic"] = stateTopic;
+    }
+    JsonObject device = doc.createNestedObject("device");
+    device.createNestedArray("identifiers").add(Mqtt::CLIENT_ID);
+    device["name"] = "RF Gateway";
+
+    char topic[80];
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/%s/%s/config", Mqtt::CLIENT_ID, objectId);
+    char payload[Mqtt::BUFFER_SIZE];
+    const size_t len = serializeJson(doc, payload, sizeof(payload));
+    mqtt.publish(topic, (const uint8_t*)payload, len, true);
+}
+
+// Non-blocking Wi-Fi/MQTT upkeep; called every loop(). A connect attempt to an
+// unreachable broker can block for a few seconds — radio events then are lost.
+static void mqttMaintain() {
+    const bool wifiUp = WiFi.status() == WL_CONNECTED;
+    if (wifiUp != wifiWasUp) {
+        wifiWasUp = wifiUp;
+        if (wifiUp) Serial.printf("[WIFI] connected, IP %s\n", WiFi.localIP().toString().c_str());
+        else        Serial.println("[WIFI] disconnected");
+    }
+
+    if (mqtt.connected()) { mqtt.loop(); return; }
+    if (!wifiUp) return;
+
+    const uint32_t now = millis();
+    if (lastMqttAttemptMs != 0 && now - lastMqttAttemptMs < Mqtt::RETRY_MS) return;
+    lastMqttAttemptMs = now;
+
+    if (!mqtt.connect(Mqtt::CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
+                      Mqtt::TOPIC_STATUS, 0, true, "offline")) {
+        Serial.printf("[MQTT] connect failed, rc=%d\n", mqtt.state());
+        return;
+    }
+    Serial.println("[MQTT] connected");
+    mqtt.publish(Mqtt::TOPIC_STATUS, "online", true);
+    publishDiscoverySensor("remote_code",  "Last remote code",  Mqtt::TOPIC_REMOTE, "{{ value_json.code }}");
+    publishDiscoverySensor("nrf24_packet", "Last nRF24 packet", Mqtt::TOPIC_NRF,    nullptr);
+}
+
+static void publishRemote(unsigned long code, unsigned int bits, unsigned int protocol,
+                          unsigned int pulseUs, float rssi) {
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"code\":%lu,\"bits\":%u,\"protocol\":%u,\"pulse\":%u,\"rssi\":%.0f}",
+             code, bits, protocol, pulseUs, rssi);
+    mqtt.publish(Mqtt::TOPIC_REMOTE, payload);
+}
+
+// Same format as the legacy nrf_receiver firmware: raw text up to the first NUL.
+static void publishNrf(const uint8_t* data, int len) {
+    char text[33] = {};
+    memcpy(text, data, min(len, 32));
+    mqtt.publish(Mqtt::TOPIC_NRF, text);
+}
+
+// ---------------------------------------------------------------------------
 // Arduino entry points
 // ---------------------------------------------------------------------------
 
@@ -294,12 +396,24 @@ void setup() {
     Serial.println("[OK] nRF24 ready");
     Serial.printf("  Address:    0x%010llX\n", Nrf::ADDRESS);
     Serial.println("  Data rate:  250 kbps | PA: MAX");
+
+    // --- Wi-Fi / MQTT (connection happens in loop() so radios run immediately) ---
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setBufferSize(Mqtt::BUFFER_SIZE);
+    mqtt.setSocketTimeout(2);
+    Serial.printf("[..] Wi-Fi \"%s\", MQTT %s:%d\n", WIFI_SSID, MQTT_HOST, MQTT_PORT);
+
     Serial.println("\n[LISTENING]\n");
 
     displayPacket(lastPacket);  // shows "Listening..."
 }
 
 void loop() {
+    mqttMaintain();
+
     if (rcSwitch.available()) {
         const unsigned long code     = rcSwitch.getReceivedValue();
         const unsigned int  bits     = rcSwitch.getReceivedBitlength();
@@ -323,6 +437,7 @@ void loop() {
             snprintf(lastPacket.info, sizeof(lastPacket.info), "P%u %ubit %uus", protocol, bits, pulseUs);
             displayPacket(lastPacket);
             logRemoteToSerial(lastPacket, code, bits, protocol, pulseUs);
+            publishRemote(code, bits, protocol, pulseUs, lastPacket.rssi);
         }
     }
 
@@ -336,5 +451,6 @@ void loop() {
         fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
         displayPacket(lastPacket);
         logPacketToSerial(lastPacket, buf, len);
+        publishNrf(buf, len);
     }
 }
