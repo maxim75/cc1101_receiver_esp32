@@ -94,7 +94,8 @@ namespace Radio {
 }
 
 namespace Nrf {
-    constexpr uint64_t ADDRESS = 0xFAB7C2F0E2LL;  // must match transmitter
+    constexpr uint64_t ADDRESS         = 0xFAB7C2F0E2LL;  // must match transmitter
+    constexpr uint32_t HEALTH_CHECK_MS = 1000;            // brownout-reset detection interval
 }
 
 namespace Mqtt {
@@ -161,6 +162,7 @@ static unsigned long lastRemoteCode   = 0;
 static uint32_t      lastRemoteSeenMs = 0;
 static uint32_t      lastMqttAttemptMs = 0;
 static bool          wifiWasUp         = false;
+static uint32_t      lastNrfCheckMs    = 0;
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -247,6 +249,17 @@ static void drawScreen() {
 // ---------------------------------------------------------------------------
 // Radio helpers
 // ---------------------------------------------------------------------------
+
+// Full nRF24 configuration. Also used to recover after a supply brownout resets
+// the module to power-on defaults (2 Mbps, powered down), which stops reception.
+static bool initNrf24() {
+    if (!nrf24.begin(&hspi)) return false;
+    nrf24.setDataRate(RF24_250KBPS);
+    nrf24.openReadingPipe(0, Nrf::ADDRESS);
+    nrf24.setPALevel(RF24_PA_MAX, true);
+    nrf24.startListening();
+    return true;
+}
 
 static void buildAsciiString(const uint8_t* data, int len, char* out, size_t outSize) {
     int maxChars = min(len, (int)(outSize - 1));
@@ -408,15 +421,11 @@ void setup() {
     Serial.println("  Modulation: OOK async | Decoder: rc-switch");
 
     // --- nRF24L01 ---
-    if (!nrf24.begin(&hspi)) {
+    if (!initNrf24()) {
         Serial.println("[ERROR] nRF24 init failed");
         displaySplash("nRF24 FAILED", "check wiring");
         while (true) delay(1000);
     }
-    nrf24.setDataRate(RF24_250KBPS);
-    nrf24.openReadingPipe(0, Nrf::ADDRESS);
-    nrf24.setPALevel(RF24_PA_MAX, true);
-    nrf24.startListening();
 
     Serial.println("[OK] nRF24 ready");
     Serial.printf("  Address:    0x%010llX\n", Nrf::ADDRESS);
@@ -460,6 +469,15 @@ void loop() {
             addMessage(text);
             logRemoteToSerial(lastPacket, code, bits, protocol, pulseUs);
             publishRemote(code, bits, protocol, pulseUs, lastPacket.rssi);
+        }
+    }
+
+    // A brownout reset restores the 2 Mbps default; re-apply our configuration
+    if (millis() - lastNrfCheckMs >= Nrf::HEALTH_CHECK_MS) {
+        lastNrfCheckMs = millis();
+        if (nrf24.getDataRate() != RF24_250KBPS) {
+            Serial.printf("[WARN] nRF24 reset detected, %s\n",
+                          initNrf24() ? "reinitialised" : "reinit failed");
         }
     }
 

@@ -118,7 +118,7 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 
 - **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 1/14/21), each radio has its own CS
 - **`Radio::`** — CC1101 RF parameters (433.92 MHz, OOK async, 270 kHz RX BW) and `REPEAT_GAP_MS` for collapsing repeated remote frames into one press
-- **`Nrf::`** — nRF24L01 pipe address (must match transmitter); RF config is 250 kbps, PA MAX, set at runtime via RF24 APIs
+- **`Nrf::`** — nRF24L01 pipe address (must match transmitter); RF config is 250 kbps, PA MAX, applied by `initNrf24()`; `HEALTH_CHECK_MS` sets the brownout-reset check interval
 - **`Mqtt::`** — client ID `rfgateway`, topics, retry interval, buffer size
 - **`Display::`** — OLED layout constants (SH1107 128x128, rotated `U8G2_R3`): header + 10-row log geometry
 - **`Clock::`** — Sydney POSIX TZ string, NTP server, `VALID_AFTER` epoch used to detect an unsynced clock
@@ -144,6 +144,8 @@ All firmware lives in `src/main.cpp`. The code is organized into namespaces and 
 | `homeassistant/sensor/rfgateway/*/config` | HA discovery for "Last remote code" and "Last nRF24 packet" sensors, published on every connect | yes |
 
 HA automations should use an MQTT trigger on the topic, not the discovery sensors' state (repeated identical codes do not change state).
+
+**nRF24 brownout recovery:** on this hardware the nRF24 module resets itself to power-on defaults (CONFIG `0x08`, 2 Mbps, RX payload width 0) under supply dips — observed every 1–2 packets while traffic flows — and then silently stops receiving. `loop()` checks `getDataRate()` every `Nrf::HEALTH_CHECK_MS`; anything other than 250 kbps means a reset, so `initNrf24()` is re-run and `[WARN] nRF24 reset detected, reinitialised` is logged. Packets arriving during the up-to-1 s gap are lost. The real fix is hardware: 10–100 µF + 100 nF across the module's VCC/GND.
 
 **SPI buses:** CC1101 uses `SPI` (FSPI/SPI2, `SPI.begin(SCK, MISO, MOSI)`); nRF24L01 uses `hspi` (HSPI/SPI3, `hspi.begin(...)`) passed to `RF24::begin(&hspi)`. The nRF24 IRQ pin is wired but not used — the firmware polls `available()` instead.
 
