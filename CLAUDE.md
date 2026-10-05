@@ -68,7 +68,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ESP32-S3 firmware that receives OOK RF packets from an ATtiny3226 transmitter (ELECHOUSE SmartRC-compatible protocol) and displays decoded packet data (hex, ASCII, RSSI) on an SH1107 128x128 OLED and serial monitor.
+ESP32-S3 firmware that receives fixed-code 433 MHz remotes (EV1527/PT2262) via a CC1101 and 2.4 GHz packets via an nRF24L01, and displays decoded data (hex, remote code info or ASCII, RSSI) on an SH1107 128x128 OLED and serial monitor.
 
 ## Build & Flash Commands
 
@@ -100,7 +100,7 @@ pio run --target clean
 |            | MOSI   | 11   |
 |            | MISO   | 13   |
 |            | CSN    | 10   |
-|            | GDO0   | 2 (RISING interrupt) |
+|            | GDO0   | 2 (async OOK data, CHANGE interrupt) |
 | nRF24L01   | SCK    | 14 (HSPI/SPI3) |
 |            | MOSI   | 1    |
 |            | MISO   | 21   |
@@ -115,27 +115,29 @@ pio run --target clean
 All firmware lives in `src/main.cpp`. The code is organized into namespaces and a single struct:
 
 - **`Pin::`** — GPIO assignments; CC1101 on FSPI (SPI2, GPIO 11/12/13), nRF24 on HSPI (SPI3, GPIO 1/14/21), each radio has its own CS
-- **`Radio::`** — CC1101 RF parameters (433.92 MHz, 4.8 kbps, OOK, sync word `0xD391`)
+- **`Radio::`** — CC1101 RF parameters (433.92 MHz, OOK async, 270 kHz RX BW) and `REPEAT_GAP_MS` for collapsing repeated remote frames into one press
 - **`Nrf::`** — nRF24L01 pipe address (must match transmitter); RF config is 250 kbps, PA MAX, set at runtime via RF24 APIs
 - **`Display::`** — OLED layout constants (SH1107 128x128)
-- **`PacketInfo`** — last received packet: `source[]`, hex, ASCII, RSSI, count, `hasRssi` flag
+- **`PacketInfo`** — last received packet: `source[]`, hex, ASCII, `info` (remote protocol/bits/pulse; shown instead of ASCII when set), RSSI, count, `hasRssi` flag
 
 **Data flow:**
-1. CC1101 GDO0 (RISING) → `onCc1101Packet()` ISR sets `cc1101Ready`; nRF24 is polled via `nrf24.available()` in `loop()`
-2. `loop()` checks `cc1101Ready`, reads with `readData()`, re-arms `startReceive()`; polls nRF24 with `available()` + `read()`, no re-arm needed
-3. `fillPacket()` populates `lastPacket` (hex truncated to 7 bytes for OLED, source label, RSSI if available)
-4. `displayPacket()` and `logPacketToSerial()` render the result; the OLED header shows which radio received the last packet
+1. CC1101 runs in async direct mode (`receiveDirectAsync()`): GDO0 outputs the raw demodulated OOK signal, and rc-switch's own CHANGE interrupt on GDO0 decodes pulse timings; nRF24 is polled via `nrf24.available()` in `loop()`
+2. `loop()` polls `rcSwitch.available()`; a code identical to the previous one within `REPEAT_GAP_MS` is treated as the same press and skipped. nRF24 is read with `available()` + `read()`, no re-arm needed
+3. `fillPacket()` populates `lastPacket` (hex truncated to 7 bytes for OLED, source label, RSSI if available); remote codes are stored as big-endian bytes and `info` is set to `P<proto> <bits>bit <pulse>us`
+4. `displayPacket()` and `logRemoteToSerial()` / `logPacketToSerial()` render the result; the OLED header shows which radio received the last packet
 
 **SPI buses:** CC1101 uses `SPI` (FSPI/SPI2, `SPI.begin(SCK, MISO, MOSI)`); nRF24L01 uses `hspi` (HSPI/SPI3, `hspi.begin(...)`) passed to `RF24::begin(&hspi)`. The nRF24 IRQ pin is wired but not used — the firmware polls `available()` instead.
 
 **Key library APIs:**
-- RadioLib `CC1101` — `setGdo0Action()`, `startReceive()`, `getPacketLength()`, `readData()`, `getRSSI()`
+- RadioLib `CC1101` — `setOOK()`, `receiveDirectAsync()`, `getRSSI()` (live RSSI register read in direct mode)
+- rc-switch `RCSwitch` — `enableReceive()`, `available()`, `getReceivedValue()`, `getReceivedBitlength()`, `getReceivedProtocol()`, `getReceivedDelay()`, `resetAvailable()`
 - RF24 `nRF24L01` — `begin(&spi)`, `setDataRate()`, `openReadingPipe()`, `setPALevel()`, `startListening()`, `available()`, `getDynamicPayloadSize()`, `getPayloadSize()`, `read()`
 - U8g2 full-framebuffer mode (`_F_`) — `clearBuffer()` / `sendBuffer()` pattern for flicker-free updates
 
 ## Dependencies (managed by PlatformIO)
 
 - `jgromes/RadioLib` — CC1101 driver
+- `sui77/rc-switch` — EV1527/PT2262 remote pulse decoder
 - `nrf24/RF24` — nRF24L01 driver
 - `olikraus/U8g2` — SH1107 OLED driver
 - `bblanchon/ArduinoJson@^6.21.0` — available but not yet used in main flow
