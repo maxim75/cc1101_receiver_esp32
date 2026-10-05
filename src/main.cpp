@@ -107,9 +107,18 @@ namespace Mqtt {
 }
 
 namespace Display {
-    constexpr uint8_t WIDTH         = 128;
-    constexpr uint8_t HEIGHT        = 128;
-    constexpr int     HEX_MAX_BYTES =   7;    // bytes shown on OLED before "..."
+    constexpr uint8_t WIDTH        = 128;
+    constexpr uint8_t HEIGHT       = 128;
+    constexpr uint8_t LOG_ROWS     =  10;   // message lines below the header
+    constexpr uint8_t LOG_TOP      =  25;   // y of first log row
+    constexpr uint8_t ROW_HEIGHT   =  10;
+    constexpr uint8_t LOG_CHARS    =  16;   // content chars per row after "HH:MM:SS "
+}
+
+namespace Clock {
+    constexpr const char* TZ_SYDNEY   = "AEST-10AEDT,M10.1.0,M4.1.0/3";
+    constexpr const char* NTP_SERVER  = "pool.ntp.org";
+    constexpr time_t      VALID_AFTER = 1700000000;   // earlier = not yet NTP-synced
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +133,7 @@ PubSubClient mqtt(wifiClient);
 
 // SH1107 panels differ in column mapping; SEEED variant avoids left/right wrap artifacts.
 U8G2_SH1107_SEEED_128X128_F_HW_I2C display(
-    U8G2_R0, U8X8_PIN_NONE, Pin::OLED_SCL, Pin::OLED_SDA);
+    U8G2_R3, U8X8_PIN_NONE, Pin::OLED_SCL, Pin::OLED_SDA);   // R3 = rotated 270° clockwise
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -132,16 +141,22 @@ U8G2_SH1107_SEEED_128X128_F_HW_I2C display(
 
 struct PacketInfo {
     char     source[8]  = {};
-    char     hex[48]    = {};
     char     ascii[22]  = {};
-    char     info[22]   = {};    // shown instead of ASCII when set (remote code info)
     float    rssi       = 0.0f;
     uint32_t count      = 0;
-    bool     valid      = false;
     bool     hasRssi    = false;
 };
 
+struct LogEntry {
+    time_t received = 0;     // 0 = clock was not synced yet
+    char   text[24] = {};
+};
+
 static PacketInfo lastPacket;
+static LogEntry      msgLog[Display::LOG_ROWS];   // [0] = newest
+static uint8_t       msgCount      = 0;
+static bool          screenDirty   = true;
+static time_t        lastDrawnSec  = 0;
 static unsigned long lastRemoteCode   = 0;
 static uint32_t      lastRemoteSeenMs = 0;
 static uint32_t      lastMqttAttemptMs = 0;
@@ -165,39 +180,65 @@ static void displaySplash(const char* line1, const char* line2 = nullptr) {
     display.sendBuffer();
 }
 
-static void displayPacket(const PacketInfo& pkt) {
+static void formatTime(time_t t, char* out, size_t outSize) {
+    if (t < Clock::VALID_AFTER) { snprintf(out, outSize, "--:--:--"); return; }
+    struct tm local;
+    localtime_r(&t, &local);
+    strftime(out, outSize, "%H:%M:%S", &local);
+}
+
+// Connection indicator: filled dot = up, hollow dot = down
+static void drawStatus(uint8_t x, uint8_t baseline, const char* label, bool up) {
+    if (up) display.drawDisc(x + 3, baseline - 4, 3);
+    else    display.drawCircle(x + 3, baseline - 4, 3);
+    display.drawStr(x + 9, baseline, label);
+}
+
+static void addMessage(const char* text) {
+    memmove(&msgLog[1], &msgLog[0], sizeof(LogEntry) * (Display::LOG_ROWS - 1));
+    const time_t now = time(nullptr);
+    msgLog[0].received = now >= Clock::VALID_AFTER ? now : 0;
+    snprintf(msgLog[0].text, sizeof(msgLog[0].text), "%s", text);
+    if (msgCount < Display::LOG_ROWS) msgCount++;
+    screenDirty = true;
+}
+
+// Header (IP, Wi-Fi/MQTT status, clock) above a rolling log, newest row inverted.
+static void drawScreen() {
+    char timeStr[12];
     display.clearBuffer();
+    display.setFontMode(1);   // transparent glyph background for inverted rows
+
     display.setFont(u8g2_font_6x10_tr);
+    const bool wifiUp = WiFi.status() == WL_CONNECTED;
+    display.drawStr(0, 9, wifiUp ? WiFi.localIP().toString().c_str() : "Wi-Fi connecting...");
+    drawStatus(0,  20, "WiFi", wifiUp);
+    drawStatus(39, 20, "MQTT", mqtt.connected());
+    formatTime(time(nullptr), timeStr, sizeof(timeStr));
+    display.drawStr(Display::WIDTH - display.getStrWidth(timeStr), 20, timeStr);
+    display.drawHLine(0, 23, Display::WIDTH);
 
-    // Header: source on left, packet counter on right
-    display.drawStr(0, 12, pkt.valid ? pkt.source : "Dual RX");
-    if (pkt.count > 0) {
-        char counter[12];
-        snprintf(counter, sizeof(counter), "#%lu", pkt.count);
-        display.drawStr(Display::WIDTH - display.getStrWidth(counter), 12, counter);
-    }
-    display.drawHLine(0, 16, Display::WIDTH);
+    display.setFont(u8g2_font_5x8_tr);
+    if (msgCount == 0) drawCenteredText(Display::LOG_TOP + 4 * Display::ROW_HEIGHT, "Listening...");
 
-    if (!pkt.valid) {
-        drawCenteredText(68, "Listening...");
-    } else {
-        constexpr uint8_t textX = 4;
-        uint8_t y = 36;
-        if (pkt.hasRssi) {
-            char rssiLine[20];
-            snprintf(rssiLine, sizeof(rssiLine), "RSSI: %.0f dBm", pkt.rssi);
-            display.drawStr(textX, y, rssiLine);
-            y += 20;
+    for (uint8_t i = 0; i < msgCount; i++) {
+        const uint8_t top = Display::LOG_TOP + i * Display::ROW_HEIGHT;
+        if (i == 0) {
+            display.drawBox(0, top, Display::WIDTH, Display::ROW_HEIGHT);
+            display.setDrawColor(0);
         }
-        display.drawStr(textX, y, pkt.hex);   y += 20;
 
-        if (pkt.info[0]) {
-            display.drawStr(textX, y, pkt.info);
-        } else {
-            char asciiLine[24];
-            snprintf(asciiLine, sizeof(asciiLine), "\"%s\"", pkt.ascii);
-            display.drawStr(textX, y, asciiLine);
+        char content[Display::LOG_CHARS + 1];
+        snprintf(content, sizeof(content), "%s", msgLog[i].text);
+        if (strlen(msgLog[i].text) > Display::LOG_CHARS) {
+            content[Display::LOG_CHARS - 2] = '.';
+            content[Display::LOG_CHARS - 1] = '.';
         }
+        formatTime(msgLog[i].received, timeStr, sizeof(timeStr));
+        display.drawStr(1,  top + 8, timeStr);
+        display.drawStr(46, top + 8, content);   // 9 chars * 5 px + 1
+
+        display.setDrawColor(1);
     }
 
     display.sendBuffer();
@@ -206,19 +247,6 @@ static void displayPacket(const PacketInfo& pkt) {
 // ---------------------------------------------------------------------------
 // Radio helpers
 // ---------------------------------------------------------------------------
-
-static void buildHexString(const uint8_t* data, int len, char* out, size_t outSize) {
-    out[0] = '\0';
-    int shown = min(len, Display::HEX_MAX_BYTES);
-    for (int i = 0; i < shown; i++) {
-        char tmp[4];
-        snprintf(tmp, sizeof(tmp), "%02X ", data[i]);
-        strncat(out, tmp, outSize - strlen(out) - 1);
-    }
-    if (len > Display::HEX_MAX_BYTES) {
-        strncat(out, "...", outSize - strlen(out) - 1);
-    }
-}
 
 static void buildAsciiString(const uint8_t* data, int len, char* out, size_t outSize) {
     int maxChars = min(len, (int)(outSize - 1));
@@ -231,13 +259,10 @@ static void buildAsciiString(const uint8_t* data, int len, char* out, size_t out
 static void fillPacket(PacketInfo& pkt, const char* source,
                        const uint8_t* buf, int len, float rssi, bool hasRssi) {
     pkt.count++;
-    pkt.valid   = true;
     pkt.rssi    = rssi;
     pkt.hasRssi = hasRssi;
     strncpy(pkt.source, source, sizeof(pkt.source) - 1);
     pkt.source[sizeof(pkt.source) - 1] = '\0';
-    pkt.info[0] = '\0';
-    buildHexString(buf, len, pkt.hex, sizeof(pkt.hex));
     buildAsciiString(buf, len, pkt.ascii, sizeof(pkt.ascii));
 }
 
@@ -405,10 +430,11 @@ void setup() {
     mqtt.setBufferSize(Mqtt::BUFFER_SIZE);
     mqtt.setSocketTimeout(2);
     Serial.printf("[..] Wi-Fi \"%s\", MQTT %s:%d\n", WIFI_SSID, MQTT_HOST, MQTT_PORT);
+    configTzTime(Clock::TZ_SYDNEY, Clock::NTP_SERVER);   // syncs once Wi-Fi is up
 
     Serial.println("\n[LISTENING]\n");
 
-    displayPacket(lastPacket);  // shows "Listening..."
+    drawScreen();  // shows "Listening..."
 }
 
 void loop() {
@@ -428,14 +454,10 @@ void loop() {
         lastRemoteSeenMs = now;
 
         if (code != 0 && !repeat) {
-            // Code as big-endian bytes so the hex view reads like the code value
-            uint8_t buf[sizeof(code)];
-            const int len = min((int)((bits + 7) / 8), (int)sizeof(buf));
-            for (int i = 0; i < len; i++) buf[i] = (uint8_t)(code >> (8 * (len - 1 - i)));
-
-            fillPacket(lastPacket, "Remote", buf, len, cc1101.getRSSI(), true);
-            snprintf(lastPacket.info, sizeof(lastPacket.info), "P%u %ubit %uus", protocol, bits, pulseUs);
-            displayPacket(lastPacket);
+            fillPacket(lastPacket, "Remote", nullptr, 0, cc1101.getRSSI(), true);
+            char text[sizeof(LogEntry::text)];
+            snprintf(text, sizeof(text), "RF %lu", code);
+            addMessage(text);
             logRemoteToSerial(lastPacket, code, bits, protocol, pulseUs);
             publishRemote(code, bits, protocol, pulseUs, lastPacket.rssi);
         }
@@ -449,8 +471,19 @@ void loop() {
         nrf24.read(buf, len);
 
         fillPacket(lastPacket, "nRF24", buf, len, 0.0f, false);
-        displayPacket(lastPacket);
+        // Display text ends at the first NUL, like the MQTT payload (hides padding)
+        char text[sizeof(LogEntry::text)];
+        buildAsciiString(buf, (int)strnlen((const char*)buf, len), text, sizeof(text));
+        addMessage(text);
         logPacketToSerial(lastPacket, buf, len);
         publishNrf(buf, len);
+    }
+
+    // Redraw on new messages and once per second for the clock and status
+    const time_t nowSec = time(nullptr);
+    if (screenDirty || nowSec != lastDrawnSec) {
+        screenDirty  = false;
+        lastDrawnSec = nowSec;
+        drawScreen();
     }
 }
